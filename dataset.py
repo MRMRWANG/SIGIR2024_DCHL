@@ -193,19 +193,23 @@ def collate_fn_4sq(batch, padding_value=3835):
         batch_user_idx.append(item["user_idx"])
         batch_user_seq_len.append(item["user_seq_len"])
         batch_label.append(item["label"])
-        batch_current_region.append(item["current_region"]) # 这里不会再报错了
+        batch_current_region.append(item["current_region"])
         batch_user_seq.append(item["user_seq"])
         batch_user_rev_seq.append(item["user_rev_seq"])
         batch_user_seq_mask.append(item["user_seq_mask"])
 
+    # 处理变长序列的 Padding
     pad_user_seq = pad_sequence(batch_user_seq, batch_first=True, padding_value=padding_value)
     pad_user_rev_seq = pad_sequence(batch_user_rev_seq, batch_first=True, padding_value=padding_value)
     pad_user_seq_mask = pad_sequence(batch_user_seq_mask, batch_first=True, padding_value=0)
 
+    # 堆叠固定维度的 Tensor
     batch_user_idx = torch.stack(batch_user_idx)
     batch_user_seq_len = torch.stack(batch_user_seq_len)
     batch_label = torch.stack(batch_label)
-    batch_current_region = torch.stack(batch_current_region)
+    
+    # 确保 current_region 转换为 LongTensor，形状为 [Batch_size]
+    batch_current_region = torch.tensor(batch_current_region, dtype=torch.long)
 
     collate_sample = {
         "user_idx": batch_user_idx,
