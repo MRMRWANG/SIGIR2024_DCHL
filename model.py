@@ -97,12 +97,13 @@ class DCHL(nn.Module):
         self.region_embedding = nn.Embedding(self.num_regions + 1, self.emb_dim, padding_idx=0)
         nn.init.xavier_uniform_(self.region_embedding.weight)
 
-        # 【核心创新】RA-Gating 动态权重生成网络
+        # =============== 【核心创新】RA-Gating 动态权重生成网络 ===============
+        # 修改为输入 4 个特征的拼接 (hg, geo, trans, region)，输出使用 Sigmoid
         self.region_view_gate = nn.Sequential(
-            nn.Linear(self.emb_dim * 2, self.emb_dim),
+            nn.Linear(self.emb_dim * 4, self.emb_dim),
             nn.ReLU(),
             nn.Linear(self.emb_dim, 3), # 输出3个权重分别对应：协同、地理、转移视图
-            nn.Softmax(dim=-1)
+            nn.Sigmoid() 
         )
         
         nn.init.xavier_uniform_(self.user_embedding.weight)
@@ -195,32 +196,37 @@ class DCHL(nn.Module):
         norm_geo_batch_users_embs = F.normalize(geo_batch_users_embs, p=2, dim=1)
         norm_trans_batch_users_embs = F.normalize(trans_batch_users_embs, p=2, dim=1)
 
-        # =============== 【核心创新区域替换】 ===============
-        # 提取当前上下文区域
+        # =============== 【改进后的核心创新区域：Score-level Late Fusion】 ===============
+        # 1. 提取当前上下文区域
         current_region = batch["current_region"]          
         region_emb = self.region_embedding(current_region)        
         region_emb = F.normalize(region_emb, p=2, dim=1)
 
-        # 构建 User 的基础上下文表示 (均值)
-        base_user_context = (norm_hg_batch_users_embs + norm_geo_batch_users_embs + norm_trans_batch_users_embs) / 3.0
+        # 2. 拼接而不是平均：保留三个视图最原始的特征差异
+        gate_input = torch.cat([
+            norm_hg_batch_users_embs,
+            norm_geo_batch_users_embs,
+            norm_trans_batch_users_embs,
+            region_emb
+        ], dim=-1)
 
-        # RA-Gating 动态生成三个视图的权重
-        weights = self.region_view_gate(torch.cat([base_user_context, region_emb], dim=-1))
+        # 3. 生成动态权重 (形状: [Batch_size, 3])
+        weights = self.region_view_gate(gate_input)
         
-        w_hg = weights[:, 0:1]    # 协同超图的权重
-        w_geo = weights[:, 1:2]   # 地理图的权重
-        w_trans = weights[:, 2:3] # 转移超图的权重
-
-        # 最终融合 (不再是简单的残差叠加，而是深度干预特征流向)
-        fusion_batch_users_embs = (
-            w_hg * norm_hg_batch_users_embs + 
-            w_geo * norm_geo_batch_users_embs + 
-            w_trans * norm_trans_batch_users_embs
-        )
-
-        fusion_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
+        # 放大基础权重，防止 Logits 坍塌导致梯度消失
+        weights = weights * 2.0 
         
-        # prediction
-        prediction = fusion_batch_users_embs @ fusion_pois_embs.T
+        w_hg = weights[:, 0:1]    
+        w_geo = weights[:, 1:2]   
+        w_trans = weights[:, 2:3] 
+
+        # 4. 采用 Score-level Late Fusion 
+        # 让各个视图在属于自己的空间内计算内积，彻底解决空间不对齐问题
+        pred_hg = norm_hg_batch_users_embs @ norm_hg_pois_embs.T
+        pred_geo = norm_geo_batch_users_embs @ norm_geo_pois_embs.T
+        pred_trans = norm_trans_batch_users_embs @ norm_trans_pois_embs.T
+
+        # 5. 最终预测分为三个独立预测的动态加权和
+        prediction = w_hg * pred_hg + w_geo * pred_geo + w_trans * pred_trans
 
         return prediction, loss_cl_poi, loss_cl_user
