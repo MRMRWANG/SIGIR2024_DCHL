@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 
+
 class MultiViewHyperConvLayer(nn.Module):
     def __init__(self, emb_dim, device):
         super(MultiViewHyperConvLayer, self).__init__()
@@ -21,6 +22,7 @@ class MultiViewHyperConvLayer(nn.Module):
         propag_pois_embs = torch.sparse.mm(HG_pu, msg_poi_agg)  # [L, d]
         return propag_pois_embs
 
+
 class DirectedHyperConvLayer(nn.Module):
     def __init__(self):
         super(DirectedHyperConvLayer, self).__init__()
@@ -29,6 +31,7 @@ class DirectedHyperConvLayer(nn.Module):
         msg_tar = torch.sparse.mm(HG_poi_tar, pois_embs)
         msg_src = torch.sparse.mm(HG_poi_src, msg_tar)
         return msg_src
+
 
 class MultiViewHyperConvNetwork(nn.Module):
     def __init__(self, num_layers, emb_dim, dropout, device):
@@ -41,12 +44,13 @@ class MultiViewHyperConvNetwork(nn.Module):
     def forward(self, pois_embs, pad_all_train_sessions, HG_up, HG_pu):
         final_pois_embs = [pois_embs]
         for layer_idx in range(self.num_layers):
-            pois_embs = self.mv_hconv_layer(pois_embs, pad_all_train_sessions, HG_up, HG_pu) 
+            pois_embs = self.mv_hconv_layer(pois_embs, pad_all_train_sessions, HG_up, HG_pu)
             pois_embs = pois_embs + final_pois_embs[-1]
-            pois_embs = F.dropout(pois_embs, self.dropout)
+            pois_embs = F.dropout(pois_embs, p=self.dropout, training=self.training)
             final_pois_embs.append(pois_embs)
-        final_pois_embs = torch.mean(torch.stack(final_pois_embs), dim=0) 
+        final_pois_embs = torch.mean(torch.stack(final_pois_embs), dim=0)
         return final_pois_embs
+
 
 class DirectedHyperConvNetwork(nn.Module):
     def __init__(self, num_layers, device, dropout=0.3):
@@ -61,10 +65,11 @@ class DirectedHyperConvNetwork(nn.Module):
         for layer_idx in range(self.num_layers):
             pois_embs = self.di_hconv_layer(pois_embs, HG_poi_src, HG_poi_tar)
             pois_embs = pois_embs + final_pois_embs[-1]
-            pois_embs = F.dropout(pois_embs, self.dropout)
+            pois_embs = F.dropout(pois_embs, p=self.dropout, training=self.training)
             final_pois_embs.append(pois_embs)
-        final_pois_embs = torch.mean(torch.stack(final_pois_embs), dim=0) 
+        final_pois_embs = torch.mean(torch.stack(final_pois_embs), dim=0)
         return final_pois_embs
+
 
 class GeoConvNetwork(nn.Module):
     def __init__(self, num_layers, dropout):
@@ -78,8 +83,9 @@ class GeoConvNetwork(nn.Module):
             pois_embs = torch.sparse.mm(geo_graph, pois_embs)
             pois_embs = pois_embs + final_pois_embs[-1]
             final_pois_embs.append(pois_embs)
-        output_pois_embs = torch.mean(torch.stack(final_pois_embs), dim=0) 
+        output_pois_embs = torch.mean(torch.stack(final_pois_embs), dim=0)
         return output_pois_embs
+
 
 class DCHL(nn.Module):
     def __init__(self, num_users, num_pois, args, device):
@@ -93,25 +99,34 @@ class DCHL(nn.Module):
 
         self.user_embedding = nn.Embedding(num_users, self.emb_dim)
         self.poi_embedding = nn.Embedding(num_pois + 1, self.emb_dim, padding_idx=num_pois)
+
+        # 先保持和你现在的数据处理兼容
         self.num_regions = args.region_bins * args.region_bins
         self.region_embedding = nn.Embedding(self.num_regions + 1, self.emb_dim, padding_idx=0)
+
+        nn.init.xavier_uniform_(self.user_embedding.weight)
+        nn.init.xavier_uniform_(self.poi_embedding.weight)
         nn.init.xavier_uniform_(self.region_embedding.weight)
 
-        # =============== 【核心创新】RA-Gating 动态权重生成网络 ===============
-        # 修改为输入 4 个特征的拼接 (hg, geo, trans, region)，输出使用 Sigmoid
+        # Gemini 的 gate 结构保留：四路拼接 + Sigmoid
         self.region_view_gate = nn.Sequential(
             nn.Linear(self.emb_dim * 4, self.emb_dim),
             nn.ReLU(),
-            nn.Linear(self.emb_dim, 3), # 输出3个权重分别对应：协同、地理、转移视图
-            nn.Sigmoid() 
+            nn.Linear(self.emb_dim, 3),
+            nn.Sigmoid()
         )
-        
-        nn.init.xavier_uniform_(self.user_embedding.weight)
-        nn.init.xavier_uniform_(self.poi_embedding.weight)
 
-        self.mv_hconv_network = MultiViewHyperConvNetwork(args.num_mv_layers, args.emb_dim, 0, device)
+        # 关键修改：不要 *2.0，改成围绕 1 的小幅缩放
+        # alpha=0.3 时，权重大约在 [0.7, 1.3]
+        self.region_gate_alpha = 0.3
+
+        self.mv_hconv_network = MultiViewHyperConvNetwork(
+            args.num_mv_layers, args.emb_dim, 0, device
+        )
         self.geo_conv_network = GeoConvNetwork(args.num_geo_layers, args.dropout)
-        self.di_hconv_network = DirectedHyperConvNetwork(args.num_di_layers, device, args.dropout)
+        self.di_hconv_network = DirectedHyperConvNetwork(
+            args.num_di_layers, device, args.dropout
+        )
 
         self.w_gate_geo = nn.Parameter(torch.FloatTensor(args.emb_dim, args.emb_dim))
         self.b_gate_geo = nn.Parameter(torch.FloatTensor(1, args.emb_dim))
@@ -119,6 +134,7 @@ class DCHL(nn.Module):
         self.b_gate_seq = nn.Parameter(torch.FloatTensor(1, args.emb_dim))
         self.w_gate_col = nn.Parameter(torch.FloatTensor(args.emb_dim, args.emb_dim))
         self.b_gate_col = nn.Parameter(torch.FloatTensor(1, args.emb_dim))
+
         nn.init.xavier_normal_(self.w_gate_geo.data)
         nn.init.xavier_normal_(self.b_gate_geo.data)
         nn.init.xavier_normal_(self.w_gate_seq.data)
@@ -163,30 +179,42 @@ class DCHL(nn.Module):
         return loss_cl_users
 
     def forward(self, dataset, batch):
-        geo_gate_pois_embs = torch.multiply(self.poi_embedding.weight[:-1],
-                                            torch.sigmoid(torch.matmul(self.poi_embedding.weight[:-1],
-                                                                       self.w_gate_geo) + self.b_gate_geo))
-        seq_gate_pois_embs = torch.multiply(self.poi_embedding.weight[:-1],
-                                            torch.sigmoid(torch.matmul(self.poi_embedding.weight[:-1],
-                                                                       self.w_gate_seq) + self.b_gate_seq))
-        col_gate_pois_embs = torch.multiply(self.poi_embedding.weight[:-1],
-                                            torch.sigmoid(torch.matmul(self.poi_embedding.weight[:-1],
-                                                                       self.w_gate_col) + self.b_gate_col))
+        user_idx = batch["user_idx"].long().to(self.device)
+        current_region = batch["current_region"].long().to(self.device)
 
-        hg_pois_embs = self.mv_hconv_network(col_gate_pois_embs, dataset.pad_all_train_sessions, dataset.HG_up, dataset.HG_pu)
-        hg_structural_users_embs = torch.sparse.mm(dataset.HG_up, hg_pois_embs) 
-        hg_batch_users_embs = hg_structural_users_embs[batch["user_idx"]] 
+        geo_gate_pois_embs = torch.multiply(
+            self.poi_embedding.weight[:-1],
+            torch.sigmoid(torch.matmul(self.poi_embedding.weight[:-1], self.w_gate_geo) + self.b_gate_geo)
+        )
+        seq_gate_pois_embs = torch.multiply(
+            self.poi_embedding.weight[:-1],
+            torch.sigmoid(torch.matmul(self.poi_embedding.weight[:-1], self.w_gate_seq) + self.b_gate_seq)
+        )
+        col_gate_pois_embs = torch.multiply(
+            self.poi_embedding.weight[:-1],
+            torch.sigmoid(torch.matmul(self.poi_embedding.weight[:-1], self.w_gate_col) + self.b_gate_col)
+        )
 
-        geo_pois_embs = self.geo_conv_network(geo_gate_pois_embs, dataset.poi_geo_graph) 
+        hg_pois_embs = self.mv_hconv_network(
+            col_gate_pois_embs, dataset.pad_all_train_sessions, dataset.HG_up, dataset.HG_pu
+        )
+        geo_pois_embs = self.geo_conv_network(geo_gate_pois_embs, dataset.poi_geo_graph)
+        trans_pois_embs = self.di_hconv_network(
+            seq_gate_pois_embs, dataset.HG_poi_src, dataset.HG_poi_tar
+        )
+
+        hg_structural_users_embs = torch.sparse.mm(dataset.HG_up, hg_pois_embs)
         geo_structural_users_embs = torch.sparse.mm(dataset.HG_up, geo_pois_embs)
-        geo_batch_users_embs = geo_structural_users_embs[batch["user_idx"]] 
-
-        trans_pois_embs = self.di_hconv_network(seq_gate_pois_embs, dataset.HG_poi_src, dataset.HG_poi_tar)
         trans_structural_users_embs = torch.sparse.mm(dataset.HG_up, trans_pois_embs)
-        trans_batch_users_embs = trans_structural_users_embs[batch["user_idx"]] 
+
+        hg_batch_users_embs = hg_structural_users_embs[user_idx]
+        geo_batch_users_embs = geo_structural_users_embs[user_idx]
+        trans_batch_users_embs = trans_structural_users_embs[user_idx]
 
         loss_cl_poi = self.cal_loss_cl_pois(hg_pois_embs, geo_pois_embs, trans_pois_embs)
-        loss_cl_user = self.cal_loss_cl_users(hg_batch_users_embs, geo_batch_users_embs, trans_batch_users_embs)
+        loss_cl_user = self.cal_loss_cl_users(
+            hg_batch_users_embs, geo_batch_users_embs, trans_batch_users_embs
+        )
 
         norm_hg_pois_embs = F.normalize(hg_pois_embs, p=2, dim=1)
         norm_geo_pois_embs = F.normalize(geo_pois_embs, p=2, dim=1)
@@ -196,13 +224,11 @@ class DCHL(nn.Module):
         norm_geo_batch_users_embs = F.normalize(geo_batch_users_embs, p=2, dim=1)
         norm_trans_batch_users_embs = F.normalize(trans_batch_users_embs, p=2, dim=1)
 
-        # =============== 【改进后的核心创新区域：Score-level Late Fusion】 ===============
-        # 1. 提取当前上下文区域
-        current_region = batch["current_region"]          
-        region_emb = self.region_embedding(current_region)        
+        # 当前区域 embedding
+        region_emb = self.region_embedding(current_region)
         region_emb = F.normalize(region_emb, p=2, dim=1)
 
-        # 2. 拼接而不是平均：保留三个视图最原始的特征差异
+        # 四路拼接作为 gate 输入
         gate_input = torch.cat([
             norm_hg_batch_users_embs,
             norm_geo_batch_users_embs,
@@ -210,29 +236,27 @@ class DCHL(nn.Module):
             region_emb
         ], dim=-1)
 
-        # 3. 生成动态权重 (形状: [Batch_size, 3])
-        weights = self.region_view_gate(gate_input)
-        
-        # 放大基础权重，防止 Logits 坍塌导致梯度消失
-        weights = weights * 2.0 
-        
-        w_hg = weights[:, 0:1]    
-        w_geo = weights[:, 1:2]   
-        w_trans = weights[:, 2:3] 
+        # Sigmoid 输出在 (0,1)
+        raw_gate = self.region_view_gate(gate_input)
 
-        # 4. 采用 Score-level Late Fusion 
-        # 让各个视图在属于自己的空间内计算内积，彻底解决空间不对齐问题
-        # 4. 采用 Score-level Late Fusion 
-        # 使用 @ 计算内积得到原始 Logits，形状为 [Batch_size, Num_POIs]
-        # 4. 预测分数计算 (Score-level)
+        # 关键修改：围绕 1 小幅调节，而不是直接 *2
+        # raw_gate=0.5 时权重正好是 1
+        # alpha=0.3 -> 权重范围大致 [0.7, 1.3]
+        weights = 1.0 + self.region_gate_alpha * (raw_gate - 0.5) * 2.0
+
+        w_hg = weights[:, 0:1]
+        w_geo = weights[:, 1:2]
+        w_trans = weights[:, 2:3]
+
+        # Score-level Late Fusion
         pred_hg = norm_hg_batch_users_embs @ norm_hg_pois_embs.T
         pred_geo = norm_geo_batch_users_embs @ norm_geo_pois_embs.T
         pred_trans = norm_trans_batch_users_embs @ norm_trans_pois_embs.T
 
-        # 5. RA-Gating 加权融合 (修复维度匹配)
-        # 确保 weights 是 [Batch, 1]，通过广播机制作用于 [Batch, Num_Pois]
-        prediction = (w_hg.view(-1, 1) * pred_hg) + \
-                     (w_geo.view(-1, 1) * pred_geo) + \
-                     (w_trans.view(-1, 1) * pred_trans)
+        prediction = (
+            w_hg * pred_hg +
+            w_geo * pred_geo +
+            w_trans * pred_trans
+        )
 
         return prediction, loss_cl_poi, loss_cl_user
