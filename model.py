@@ -224,12 +224,13 @@ class DCHL(nn.Module):
         # 让各个视图在属于自己的空间内计算内积，彻底解决空间不对齐问题
         # 4. 采用 Score-level Late Fusion 
         # 使用 @ 计算内积得到原始 Logits，形状为 [Batch_size, Num_POIs]
+        # 4. 预测分数计算 (Score-level)
         pred_hg = norm_hg_batch_users_embs @ norm_hg_pois_embs.T
         pred_geo = norm_geo_batch_users_embs @ norm_geo_pois_embs.T
         pred_trans = norm_trans_batch_users_embs @ norm_trans_pois_embs.T
 
-        # 5. 最终预测：确保权重 w (Batch, 1) 能正确作用于 pred (Batch, Pois)
-        # 使用 view(-1, 1) 强制确保权重维度为 2D，对齐 pred 的维度
+        # 5. RA-Gating 加权融合 (修复维度匹配)
+        # 确保 weights 是 [Batch, 1]，通过广播机制作用于 [Batch, Num_Pois]
         prediction = (w_hg.view(-1, 1) * pred_hg) + \
                      (w_geo.view(-1, 1) * pred_geo) + \
                      (w_trans.view(-1, 1) * pred_trans)
