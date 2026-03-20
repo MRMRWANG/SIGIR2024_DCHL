@@ -10,8 +10,12 @@ import os
 import logging
 import yaml
 import datetime
-import torch.optim as optim
 import random
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
 
 from dataset import *
 from model import *
@@ -24,25 +28,34 @@ torch.backends.cudnn.enabled = True
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', default="NYC", help='NYC/TKY/Gowalla')
-parser.add_argument('--seed', default=2023, help='Random seed')
+parser.add_argument('--seed', default=2023, type=int, help='Random seed')
 parser.add_argument('--distance_threshold', default=2.5, type=float, help='distance threshold 2.5 or 0.25')
 parser.add_argument('--num_epochs', type=int, default=30, help='number of epochs')
 parser.add_argument('--batch_size', type=int, default=200, help='input batch size')
 parser.add_argument('--emb_dim', type=int, default=128, help='embedding size')
 parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
-parser.add_argument('--decay', type=float, default=5e-4)    
-parser.add_argument('--dropout', type=float, default=0.3, help='dropout')    
+parser.add_argument('--decay', type=float, default=5e-4)
+parser.add_argument('--dropout', type=float, default=0.3, help='dropout')
 parser.add_argument('--deviceID', type=int, default=0)
-parser.add_argument('--lambda_cl', type=float, default=0.1, help='lambda of contrastive loss')
+
+# 建议先调低一点，避免新分支和 CL 打架
+parser.add_argument('--lambda_cl', type=float, default=0.05, help='lambda of contrastive loss')
+
 parser.add_argument('--num_mv_layers', type=int, default=3)
 parser.add_argument('--num_geo_layers', type=int, default=3)
 parser.add_argument('--num_di_layers', type=int, default=3, help='layer number of directed hypergraph convolutional network')
 parser.add_argument('--temperature', type=float, default=0.1)
 parser.add_argument('--keep_rate', type=float, default=1, help='ratio of edges to keep')
-parser.add_argument('--keep_rate_poi', type=float, default=1, help='ratio of poi-poi directed edges to keep')  
-parser.add_argument('--lr-scheduler-factor', type=float, default=0.1, help='Learning rate scheduler factor')
+parser.add_argument('--keep_rate_poi', type=float, default=1, help='ratio of poi-poi directed edges to keep')
+parser.add_argument('--lr_scheduler_factor', type=float, default=0.1, help='Learning rate scheduler factor')
 parser.add_argument('--save_dir', type=str, default="logs")
 parser.add_argument('--region_bins', type=int, default=10)
+
+# 新增参数
+parser.add_argument('--user_topk', type=int, default=10)
+parser.add_argument('--user_res_beta', type=float, default=0.15)
+parser.add_argument('--mix_beta', type=float, default=0.10)
+
 args = parser.parse_args()
 
 random.seed(args.seed)
@@ -60,11 +73,15 @@ os.mkdir(current_save_dir)
 
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s %(message)s',
-                    datefmt='%Y-%m-%d %H:%M:%S',
-                    filename=os.path.join(current_save_dir, f"log_training.txt"),
-                    filemode='w+')
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    filename=os.path.join(current_save_dir, "log_training.txt"),
+    filemode='w+'
+)
+
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -76,10 +93,12 @@ args_filename = args.dataset + '_args.yaml'
 with open(os.path.join(current_save_dir, args_filename), 'w') as f:
     yaml.dump(vars(args), f, sort_keys=False)
 
+
 def main():
     logging.info("1. Parse Arguments")
     logging.info(args)
     logging.info("device: {}".format(device))
+
     if args.dataset == "TKY":
         NUM_USERS = 2173
         NUM_POIS = 7038
@@ -88,29 +107,43 @@ def main():
         NUM_USERS = 834
         NUM_POIS = 3835
         PADDING_IDX = NUM_POIS
+    else:
+        raise ValueError("dataset must be NYC or TKY")
 
     logging.info("2. Load Dataset")
-    train_dataset = POIDataset(data_filename="datasets/{}/train_poi_zero.txt".format(args.dataset),
-                               pois_coos_filename="datasets/{}/{}_pois_coos_poi_zero.pkl".format(args.dataset, args.dataset),
-                               num_users=NUM_USERS,
-                               num_pois=NUM_POIS,
-                               padding_idx=PADDING_IDX,
-                               args=args,
-                               device=device)
+    train_dataset = POIDataset(
+        data_filename="datasets/{}/train_poi_zero.txt".format(args.dataset),
+        pois_coos_filename="datasets/{}/{}_pois_coos_poi_zero.pkl".format(args.dataset, args.dataset),
+        num_users=NUM_USERS,
+        num_pois=NUM_POIS,
+        padding_idx=PADDING_IDX,
+        args=args,
+        device=device
+    )
 
-    test_dataset = POIDataset(data_filename="datasets/{}/test_poi_zero.txt".format(args.dataset),
-                              pois_coos_filename="datasets/{}/{}_pois_coos_poi_zero.pkl".format(args.dataset, args.dataset),
-                              num_users=NUM_USERS,
-                              num_pois=NUM_POIS,
-                              padding_idx=PADDING_IDX,
-                              args=args,
-                              device=device)
+    test_dataset = POIDataset(
+        data_filename="datasets/{}/test_poi_zero.txt".format(args.dataset),
+        pois_coos_filename="datasets/{}/{}_pois_coos_poi_zero.pkl".format(args.dataset, args.dataset),
+        num_users=NUM_USERS,
+        num_pois=NUM_POIS,
+        padding_idx=PADDING_IDX,
+        args=args,
+        device=device
+    )
 
     logging.info("3. Construct DataLoader")
-    train_dataloader = DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True,
-                                  collate_fn=lambda batch: collate_fn_4sq(batch, padding_value=PADDING_IDX))
-    test_dataloader = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=True,
-                                 collate_fn=lambda batch: collate_fn_4sq(batch, padding_value=PADDING_IDX))
+    train_dataloader = DataLoader(
+        dataset=train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=lambda batch: collate_fn_4sq(batch, padding_value=PADDING_IDX)
+    )
+    test_dataloader = DataLoader(
+        dataset=test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: collate_fn_4sq(batch, padding_value=PADDING_IDX)
+    )
 
     logging.info("4. Load Model")
     model = DCHL(NUM_USERS, NUM_POIS, args, device)
@@ -119,35 +152,45 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.decay)
     criterion = nn.CrossEntropyLoss().to(device)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 'min',  factor=args.lr_scheduler_factor)
+        optimizer, 'min', factor=args.lr_scheduler_factor
+    )
 
     logging.info("5. Start Training")
     Ks_list = [1, 5, 10, 20]
-    final_results = {"Rec1": 0.0, "Rec5": 0.0, "Rec10": 0.0, "Rec20": 0.0,
-                     "NDCG1": 0.0, "NDCG5": 0.0, "NDCG10": 0.0, "NDCG20": 0.0,
-                     }
+    final_results = {
+        "Rec1": 0.0, "Rec5": 0.0, "Rec10": 0.0, "Rec20": 0.0,
+        "NDCG1": 0.0, "NDCG5": 0.0, "NDCG10": 0.0, "NDCG20": 0.0,
+    }
 
     monitor_loss = float('inf')
     best_test_rec5 = 0.0
+
     for epoch in range(args.num_epochs):
         logging.info("================= Epoch {}/{} =================".format(epoch, args.num_epochs))
         start_time = time.time()
         model.train()
 
         train_loss = 0.0
-
         train_recall_array = np.zeros(shape=(len(train_dataloader), len(Ks_list)))
         train_ndcg_array = np.zeros(shape=(len(train_dataloader), len(Ks_list)))
+
         for idx, batch in enumerate(train_dataloader):
             logging.info("Train. Batch {}/{}".format(idx, len(train_dataloader)))
             optimizer.zero_grad()
 
-            predictions, loss_cl_users, loss_cl_pois = model(train_dataset, batch)
+            predictions, loss_cl_pois, loss_cl_users = model(train_dataset, batch)
 
             loss_rec = criterion(predictions, batch["label"].to(device))
             loss = loss_rec + args.lambda_cl * (loss_cl_pois + loss_cl_users)
-            logging.info("Train. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; "
-                         "loss: {:.4f}".format(loss_rec.item(), loss_cl_pois, loss_cl_users, loss))
+
+            logging.info(
+                "Train. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; loss: {:.4f}".format(
+                    loss_rec.item(),
+                    loss_cl_pois.item() if hasattr(loss_cl_pois, "item") else float(loss_cl_pois),
+                    loss_cl_users.item() if hasattr(loss_cl_users, "item") else float(loss_cl_users),
+                    loss.item()
+                )
+            )
 
             loss.backward()
             optimizer.step()
@@ -178,12 +221,19 @@ def main():
             for idx, batch in enumerate(test_dataloader):
                 logging.info("Test. Batch {}/{}".format(idx, len(test_dataloader)))
 
-                predictions, loss_cl_users, loss_cl_pois = model(test_dataset, batch)
+                predictions, loss_cl_pois, loss_cl_users = model(test_dataset, batch)
 
                 loss_rec = criterion(predictions, batch["label"].to(device))
                 loss = loss_rec + args.lambda_cl * (loss_cl_pois + loss_cl_users)
-                logging.info("Test. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; "
-                             "loss: {:.4f}".format(loss_rec.item(), loss_cl_pois, loss_cl_users, loss))
+
+                logging.info(
+                    "Test. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; loss: {:.4f}".format(
+                        loss_rec.item(),
+                        loss_cl_pois.item() if hasattr(loss_cl_pois, "item") else float(loss_cl_pois),
+                        loss_cl_users.item() if hasattr(loss_cl_users, "item") else float(loss_cl_users),
+                        loss.item()
+                    )
+                )
 
                 test_loss += loss.item()
 
@@ -227,12 +277,14 @@ def main():
             elif k == 20:
                 final_results["Rec20"] = max(final_results["Rec20"], np.mean(test_recall_array[:, 3]))
                 final_results["NDCG20"] = max(final_results["NDCG20"], np.mean(test_ndcg_array[:, 3]))
+
         logging.info("==================================\n\n")
 
     logging.info("6. Final Results")
     formatted_dict = {key: f"{value:.4f}" for key, value in final_results.items()}
     logging.info(formatted_dict)
     logging.info("\n")
+
 
 if __name__ == '__main__':
     main()

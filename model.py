@@ -4,8 +4,9 @@
 @paper: [24 SIGIR] Disentangled Contrastive Hypergraph Learning for Next POI Recommendation
 """
 
-import torch.nn as nn
+import math
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -43,7 +44,7 @@ class MultiViewHyperConvNetwork(nn.Module):
 
     def forward(self, pois_embs, pad_all_train_sessions, HG_up, HG_pu):
         final_pois_embs = [pois_embs]
-        for layer_idx in range(self.num_layers):
+        for _ in range(self.num_layers):
             pois_embs = self.mv_hconv_layer(pois_embs, pad_all_train_sessions, HG_up, HG_pu)
             pois_embs = pois_embs + final_pois_embs[-1]
             pois_embs = F.dropout(pois_embs, p=self.dropout, training=self.training)
@@ -62,7 +63,7 @@ class DirectedHyperConvNetwork(nn.Module):
 
     def forward(self, pois_embs, HG_poi_src, HG_poi_tar):
         final_pois_embs = [pois_embs]
-        for layer_idx in range(self.num_layers):
+        for _ in range(self.num_layers):
             pois_embs = self.di_hconv_layer(pois_embs, HG_poi_src, HG_poi_tar)
             pois_embs = pois_embs + final_pois_embs[-1]
             pois_embs = F.dropout(pois_embs, p=self.dropout, training=self.training)
@@ -100,25 +101,13 @@ class DCHL(nn.Module):
         self.user_embedding = nn.Embedding(num_users, self.emb_dim)
         self.poi_embedding = nn.Embedding(num_pois + 1, self.emb_dim, padding_idx=num_pois)
 
-        # 先保持和你现在的数据处理兼容
+        # 真实 region 从 1 开始，0 留给 padding
         self.num_regions = args.region_bins * args.region_bins
         self.region_embedding = nn.Embedding(self.num_regions + 1, self.emb_dim, padding_idx=0)
 
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.poi_embedding.weight)
         nn.init.xavier_uniform_(self.region_embedding.weight)
-
-        # Gemini 的 gate 结构保留：四路拼接 + Sigmoid
-        self.region_view_gate = nn.Sequential(
-            nn.Linear(self.emb_dim * 4, self.emb_dim),
-            nn.ReLU(),
-            nn.Linear(self.emb_dim, 3),
-            nn.Sigmoid()
-        )
-
-        # 关键修改：不要 *2.0，改成围绕 1 的小幅缩放
-        # alpha=0.3 时，权重大约在 [0.7, 1.3]
-        self.region_gate_alpha = 0.3
 
         self.mv_hconv_network = MultiViewHyperConvNetwork(
             args.num_mv_layers, args.emb_dim, 0, device
@@ -141,6 +130,23 @@ class DCHL(nn.Module):
         nn.init.xavier_normal_(self.b_gate_seq.data)
         nn.init.xavier_normal_(self.w_gate_col.data)
         nn.init.xavier_normal_(self.b_gate_col.data)
+
+        # 新增：区域约束相似邻居增强
+        self.user_res_beta = args.user_res_beta
+        self.mix_beta = args.mix_beta
+
+        self.neighbor_query = nn.Linear(self.emb_dim * 2, self.emb_dim)
+        self.neighbor_key = nn.Linear(self.emb_dim, self.emb_dim)
+        self.neighbor_value = nn.Linear(self.emb_dim, self.emb_dim)
+
+        # 改成 softmax gate，初始尽量接近原版平均融合
+        self.region_view_gate = nn.Sequential(
+            nn.Linear(self.emb_dim * 4, self.emb_dim),
+            nn.ReLU(),
+            nn.Linear(self.emb_dim, 3)
+        )
+        nn.init.zeros_(self.region_view_gate[2].weight)
+        nn.init.zeros_(self.region_view_gate[2].bias)
 
         self.dropout = nn.Dropout(args.dropout)
 
@@ -181,6 +187,8 @@ class DCHL(nn.Module):
     def forward(self, dataset, batch):
         user_idx = batch["user_idx"].long().to(self.device)
         current_region = batch["current_region"].long().to(self.device)
+        neighbor_users = batch["neighbor_users"].long().to(self.device)     # [B, K]
+        neighbor_mask = batch["neighbor_mask"].float().to(self.device)      # [B, K]
 
         geo_gate_pois_embs = torch.multiply(
             self.poi_embedding.weight[:-1],
@@ -220,7 +228,8 @@ class DCHL(nn.Module):
         norm_geo_pois_embs = F.normalize(geo_pois_embs, p=2, dim=1)
         norm_trans_pois_embs = F.normalize(trans_pois_embs, p=2, dim=1)
 
-        norm_hg_batch_users_embs = F.normalize(hg_batch_users_embs, p=2, dim=1)
+        norm_all_hg_users_embs = F.normalize(hg_structural_users_embs, p=2, dim=1)
+        norm_hg_batch_users_embs = norm_all_hg_users_embs[user_idx]
         norm_geo_batch_users_embs = F.normalize(geo_batch_users_embs, p=2, dim=1)
         norm_trans_batch_users_embs = F.normalize(trans_batch_users_embs, p=2, dim=1)
 
@@ -228,35 +237,56 @@ class DCHL(nn.Module):
         region_emb = self.region_embedding(current_region)
         region_emb = F.normalize(region_emb, p=2, dim=1)
 
-        # 四路拼接作为 gate 输入
+        # ===== 新增：区域约束用户邻居增强，只增强 HG 分支 =====
+        safe_neighbor_users = neighbor_users.clone()
+        safe_neighbor_users[safe_neighbor_users < 0] = 0
+
+        neighbor_hg_embs = norm_all_hg_users_embs[safe_neighbor_users]   # [B, K, d]
+
+        query = self.neighbor_query(
+            torch.cat([norm_hg_batch_users_embs, region_emb], dim=-1)
+        ).unsqueeze(1)  # [B, 1, d]
+
+        keys = self.neighbor_key(neighbor_hg_embs)        # [B, K, d]
+        values = self.neighbor_value(neighbor_hg_embs)    # [B, K, d]
+
+        attn_scores = torch.sum(query * keys, dim=-1) / math.sqrt(self.emb_dim)  # [B, K]
+        attn_scores = attn_scores.masked_fill(neighbor_mask == 0, -1e9)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+
+        neighbor_ctx = torch.sum(attn_weights.unsqueeze(-1) * values, dim=1)  # [B, d]
+        has_neighbor = (neighbor_mask.sum(dim=1, keepdim=True) > 0).float()
+        neighbor_ctx = has_neighbor * neighbor_ctx
+        neighbor_ctx = F.normalize(neighbor_ctx, p=2, dim=1)
+
+        hg_user_final = F.normalize(
+            norm_hg_batch_users_embs + self.user_res_beta * neighbor_ctx,
+            p=2,
+            dim=1
+        )
+
+        # ===== 预测分数 =====
+        pred_hg = hg_user_final @ norm_hg_pois_embs.T
+        pred_geo = norm_geo_batch_users_embs @ norm_geo_pois_embs.T
+        pred_trans = norm_trans_batch_users_embs @ norm_trans_pois_embs.T
+
+        # ===== 区域感知 softmax 残差融合 =====
         gate_input = torch.cat([
-            norm_hg_batch_users_embs,
+            hg_user_final,
             norm_geo_batch_users_embs,
             norm_trans_batch_users_embs,
             region_emb
         ], dim=-1)
 
-        # Sigmoid 输出在 (0,1)
-        raw_gate = self.region_view_gate(gate_input)
+        mix = torch.softmax(self.region_view_gate(gate_input), dim=-1)
 
-        # 关键修改：围绕 1 小幅调节，而不是直接 *2
-        # raw_gate=0.5 时权重正好是 1
-        # alpha=0.3 -> 权重范围大致 [0.7, 1.3]
-        weights = 1.0 + self.region_gate_alpha * (raw_gate - 0.5) * 2.0
-
-        w_hg = weights[:, 0:1]
-        w_geo = weights[:, 1:2]
-        w_trans = weights[:, 2:3]
-
-        # Score-level Late Fusion
-        pred_hg = norm_hg_batch_users_embs @ norm_hg_pois_embs.T
-        pred_geo = norm_geo_batch_users_embs @ norm_geo_pois_embs.T
-        pred_trans = norm_trans_batch_users_embs @ norm_trans_pois_embs.T
-
-        prediction = (
-            w_hg * pred_hg +
-            w_geo * pred_geo +
-            w_trans * pred_trans
+        pred_base = (pred_hg + pred_geo + pred_trans) / 3.0
+        pred_region = (
+            mix[:, 0:1] * pred_hg +
+            mix[:, 1:2] * pred_geo +
+            mix[:, 2:3] * pred_trans
         )
+
+        prediction = pred_base + self.mix_beta * (pred_region - pred_base)
 
         return prediction, loss_cl_poi, loss_cl_user

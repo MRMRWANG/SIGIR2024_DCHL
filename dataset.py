@@ -4,10 +4,23 @@
 @paper: [24 SIGIR] Disentangled Contrastive Hypergraph Learning for Next POI Recommendation
 """
 
+import math
+from collections import defaultdict
+
+import torch
 from utils import *
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from region_utils import build_poi2region
+
+
+def binary_cosine(list_a, list_b):
+    set_a, set_b = set(list_a), set(list_b)
+    if len(set_a) == 0 or len(set_b) == 0:
+        return 0.0
+    inter = len(set_a & set_b)
+    return inter / math.sqrt(len(set_a) * len(set_b) + 1e-8)
+
 
 class POIDataset(Dataset):
     def __init__(self, data_filename, pois_coos_filename, num_users, num_pois, padding_idx, args, device):
@@ -18,11 +31,12 @@ class POIDataset(Dataset):
         self.labels_dict = self.data[1]
         self.pois_coos_dict = load_dict_from_pkl(pois_coos_filename)
 
-        # 【新增】构建 poi -> region mapping
+        # 这里不要再二次 +1，region_utils.py 已经处理好了
         self.poi2region, self.num_regions = build_poi2region(
             self.pois_coos_dict,
             num_bins=args.region_bins
         )
+        self.num_regions = int(self.num_regions)
 
         # definition
         self.num_users = num_users
@@ -31,6 +45,7 @@ class POIDataset(Dataset):
         self.distance_threshold = args.distance_threshold
         self.keep_rate = args.keep_rate
         self.device = device
+        self.user_topk = args.user_topk
 
         # get user's trajectory, reversed trajectory and its length
         self.users_trajs_dict, self.users_trajs_lens_dict = get_user_complete_traj(self.sessions_dict)
@@ -73,6 +88,54 @@ class POIDataset(Dataset):
         self.HG_poi_tar = self.Deg_H_poi_tar * self.H_poi_tar    # [L, L]
         self.HG_poi_tar = transform_csr_matrix_to_tensor(self.HG_poi_tar).to(device)
 
+        # 新增：构建 区域约束的 TopK 相似用户
+        self.build_user_region_neighbors(topk=self.user_topk)
+
+    def build_user_region_histories(self):
+        self.user_region_pois = [defaultdict(list) for _ in range(self.num_users)]
+        self.region2users = defaultdict(set)
+
+        for u in range(self.num_users):
+            traj = self.users_trajs_dict[u]
+            for p in traj:
+                r = int(self.poi2region[int(p)])
+                self.user_region_pois[u][r].append(int(p))
+                self.region2users[r].add(u)
+
+    def build_user_region_neighbors(self, topk=10):
+        self.build_user_region_histories()
+
+        # region 已经是 1 ~ num_regions，0 留给 padding
+        self.user_region_neighbors = torch.full(
+            (self.num_users, self.num_regions + 1, topk),
+            -1,
+            dtype=torch.long
+        )
+        self.user_region_neighbor_mask = torch.zeros(
+            (self.num_users, self.num_regions + 1, topk),
+            dtype=torch.float
+        )
+
+        for r, users_in_r in self.region2users.items():
+            users_in_r = list(users_in_r)
+            for u in users_in_r:
+                pois_u = self.user_region_pois[u][r]
+                sims = []
+                for v in users_in_r:
+                    if v == u:
+                        continue
+                    pois_v = self.user_region_pois[v][r]
+                    sim = binary_cosine(pois_u, pois_v)
+                    if sim > 0:
+                        sims.append((v, sim))
+
+                sims.sort(key=lambda x: x[1], reverse=True)
+                sims = sims[:topk]
+
+                for i, (v, _) in enumerate(sims):
+                    self.user_region_neighbors[u, r, i] = v
+                    self.user_region_neighbor_mask[u, r, i] = 1.0
+
     def __len__(self):
         return self.num_users
 
@@ -83,23 +146,26 @@ class POIDataset(Dataset):
         user_rev_seq = self.users_rev_trajs_dict[user_idx]
         label = self.labels_dict[user_idx]
 
-        # 【新增】获取当前轨迹最后一个 POI 所在的区域
-        current_region = self.poi2region[int(user_seq[-1])]
+        # 当前轨迹最后一个 POI 所在区域
+        current_region = int(self.poi2region[int(user_seq[-1])])
+
+        neighbor_users = self.user_region_neighbors[user_idx, current_region]
+        neighbor_mask = self.user_region_neighbor_mask[user_idx, current_region]
 
         sample = {
-            "user_idx": torch.tensor(user_idx).to(self.device),
-            "user_seq": torch.tensor(user_seq).to(self.device),
-            "user_rev_seq": torch.tensor(user_rev_seq).to(self.device),
-            "user_seq_len": torch.tensor(user_seq_len).to(self.device),
-            "user_seq_mask": torch.tensor(user_seq_mask).to(self.device),
-            "label": torch.tensor(label).to(self.device),
-            "current_region": torch.tensor(current_region).to(self.device), # 加入返回字典
+            "user_idx": torch.tensor(user_idx, dtype=torch.long).to(self.device),
+            "user_seq": torch.tensor(user_seq, dtype=torch.long).to(self.device),
+            "user_rev_seq": torch.tensor(user_rev_seq, dtype=torch.long).to(self.device),
+            "user_seq_len": torch.tensor(user_seq_len, dtype=torch.long).to(self.device),
+            "user_seq_mask": torch.tensor(user_seq_mask, dtype=torch.long).to(self.device),
+            "label": torch.tensor(label, dtype=torch.long).to(self.device),
+            "current_region": torch.tensor(current_region, dtype=torch.long).to(self.device),
+            "neighbor_users": neighbor_users.to(self.device),
+            "neighbor_mask": neighbor_mask.to(self.device),
         }
 
         return sample
 
-
-# =============== 其他类保持不变，确保 collate_fn_4sq 包含 current_region ===============
 
 class POIPartialDataset(Dataset):
     def __init__(self, full_dataset, user_indices):
@@ -118,10 +184,12 @@ class POISessionDataset(Dataset):
         self.labels_dict = load_dict_from_pkl(label_filename)
         self.pois_coos_dict = load_dict_from_pkl(pois_coos_filename)
 
+        # 这里也不要再二次 +1
         self.poi2region, self.num_regions = build_poi2region(
             self.pois_coos_dict,
             num_bins=args.region_bins
         )
+        self.num_regions = int(self.num_regions)
 
         self.users_trajs_dict = self.sessions_dict
         self.num_pois = num_pois
@@ -130,6 +198,7 @@ class POISessionDataset(Dataset):
         self.distance_threshold = args.distance_threshold
         self.keep_rate = args.keep_rate
         self.device = device
+        self.user_topk = args.user_topk
 
         self.poi_geo_adj = gen_poi_geo_adj(num_pois, self.pois_coos_dict, self.distance_threshold)
         self.poi_geo_graph_matrix = normalized_adj(adj=self.poi_geo_adj, is_symmetric=False)
@@ -156,6 +225,52 @@ class POISessionDataset(Dataset):
         self.HG_up = self.Deg_H_up * self.H_up
         self.HG_up = transform_csr_matrix_to_tensor(self.HG_up).to(device)
 
+        self.build_user_region_neighbors(topk=self.user_topk)
+
+    def build_user_region_histories(self):
+        self.user_region_pois = [defaultdict(list) for _ in range(self.num_sessions)]
+        self.region2users = defaultdict(set)
+
+        for u in range(self.num_sessions):
+            traj = self.users_trajs_dict[u]
+            for p in traj:
+                r = int(self.poi2region[int(p)])
+                self.user_region_pois[u][r].append(int(p))
+                self.region2users[r].add(u)
+
+    def build_user_region_neighbors(self, topk=10):
+        self.build_user_region_histories()
+
+        self.user_region_neighbors = torch.full(
+            (self.num_sessions, self.num_regions + 1, topk),
+            -1,
+            dtype=torch.long
+        )
+        self.user_region_neighbor_mask = torch.zeros(
+            (self.num_sessions, self.num_regions + 1, topk),
+            dtype=torch.float
+        )
+
+        for r, users_in_r in self.region2users.items():
+            users_in_r = list(users_in_r)
+            for u in users_in_r:
+                pois_u = self.user_region_pois[u][r]
+                sims = []
+                for v in users_in_r:
+                    if v == u:
+                        continue
+                    pois_v = self.user_region_pois[v][r]
+                    sim = binary_cosine(pois_u, pois_v)
+                    if sim > 0:
+                        sims.append((v, sim))
+
+                sims.sort(key=lambda x: x[1], reverse=True)
+                sims = sims[:topk]
+
+                for i, (v, _) in enumerate(sims):
+                    self.user_region_neighbors[u, r, i] = v
+                    self.user_region_neighbor_mask[u, r, i] = 1.0
+
     def __len__(self):
         return self.num_sessions
 
@@ -166,19 +281,24 @@ class POISessionDataset(Dataset):
         user_rev_seq = user_seq[::-1]
         label = self.labels_dict[user_idx]
 
-        current_region = self.poi2region[int(user_seq[-1])]
+        current_region = int(self.poi2region[int(user_seq[-1])])
+        neighbor_users = self.user_region_neighbors[user_idx, current_region]
+        neighbor_mask = self.user_region_neighbor_mask[user_idx, current_region]
 
         sample = {
-            "user_idx": torch.tensor(user_idx).to(self.device),
-            "user_seq": torch.tensor(user_seq).to(self.device),
-            "user_rev_seq": torch.tensor(user_rev_seq).to(self.device),
-            "user_seq_len": torch.tensor(user_seq_len).to(self.device),
-            "user_seq_mask": torch.tensor(user_seq_mask).to(self.device),
-            "label": torch.tensor(label).to(self.device),
-            "current_region": torch.tensor(current_region).to(self.device),
+            "user_idx": torch.tensor(user_idx, dtype=torch.long).to(self.device),
+            "user_seq": torch.tensor(user_seq, dtype=torch.long).to(self.device),
+            "user_rev_seq": torch.tensor(user_rev_seq, dtype=torch.long).to(self.device),
+            "user_seq_len": torch.tensor(user_seq_len, dtype=torch.long).to(self.device),
+            "user_seq_mask": torch.tensor(user_seq_mask, dtype=torch.long).to(self.device),
+            "label": torch.tensor(label, dtype=torch.long).to(self.device),
+            "current_region": torch.tensor(current_region, dtype=torch.long).to(self.device),
+            "neighbor_users": neighbor_users.to(self.device),
+            "neighbor_mask": neighbor_mask.to(self.device),
         }
 
         return sample
+
 
 def collate_fn_4sq(batch, padding_value=3835):
     batch_user_idx = []
@@ -188,12 +308,16 @@ def collate_fn_4sq(batch, padding_value=3835):
     batch_user_seq_mask = []
     batch_label = []
     batch_current_region = []
+    batch_neighbor_users = []
+    batch_neighbor_mask = []
 
     for item in batch:
         batch_user_idx.append(item["user_idx"])
         batch_user_seq_len.append(item["user_seq_len"])
         batch_label.append(item["label"])
         batch_current_region.append(item["current_region"])
+        batch_neighbor_users.append(item["neighbor_users"])
+        batch_neighbor_mask.append(item["neighbor_mask"])
         batch_user_seq.append(item["user_seq"])
         batch_user_rev_seq.append(item["user_rev_seq"])
         batch_user_seq_mask.append(item["user_seq_mask"])
@@ -202,12 +326,12 @@ def collate_fn_4sq(batch, padding_value=3835):
     pad_user_rev_seq = pad_sequence(batch_user_rev_seq, batch_first=True, padding_value=padding_value)
     pad_user_seq_mask = pad_sequence(batch_user_seq_mask, batch_first=True, padding_value=0)
 
-    # 统一转换为 Tensor
     batch_user_idx = torch.stack(batch_user_idx)
     batch_user_seq_len = torch.stack(batch_user_seq_len)
     batch_label = torch.stack(batch_label)
-    # 核心修复：确保是 LongTensor 且维度正确
-    batch_current_region = torch.tensor(batch_current_region, dtype=torch.long)
+    batch_current_region = torch.stack(batch_current_region).long()
+    batch_neighbor_users = torch.stack(batch_neighbor_users).long()
+    batch_neighbor_mask = torch.stack(batch_neighbor_mask).float()
 
     return {
         "user_idx": batch_user_idx,
@@ -217,4 +341,6 @@ def collate_fn_4sq(batch, padding_value=3835):
         "user_seq_mask": pad_user_seq_mask,
         "label": batch_label,
         "current_region": batch_current_region,
+        "neighbor_users": batch_neighbor_users,
+        "neighbor_mask": batch_neighbor_mask,
     }
