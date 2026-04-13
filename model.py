@@ -9,6 +9,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def _safe_logit(p):
+    p = min(max(float(p), 1e-6), 1.0 - 1e-6)
+    return math.log(p / (1.0 - p))
+
 
 class MultiViewHyperConvLayer(nn.Module):
     def __init__(self, emb_dim, device):
@@ -88,6 +92,22 @@ class GeoConvNetwork(nn.Module):
         return output_pois_embs
 
 
+class RegionConvNetwork(nn.Module):
+    def __init__(self, num_layers, dropout):
+        super(RegionConvNetwork, self).__init__()
+        self.num_layers = num_layers
+        self.dropout = dropout
+
+    def forward(self, region_embs, region_graph):
+        final_region_embs = [region_embs]
+        for _ in range(self.num_layers):
+            region_embs = torch.sparse.mm(region_graph, region_embs)
+            region_embs = region_embs + final_region_embs[-1]
+            region_embs = F.dropout(region_embs, p=self.dropout, training=self.training)
+            final_region_embs.append(region_embs)
+        return torch.mean(torch.stack(final_region_embs), dim=0)
+
+
 class DCHL(nn.Module):
     def __init__(self, num_users, num_pois, args, device):
         super(DCHL, self).__init__()
@@ -116,6 +136,9 @@ class DCHL(nn.Module):
         self.di_hconv_network = DirectedHyperConvNetwork(
             args.num_di_layers, device, args.dropout
         )
+        self.region_conv_network = RegionConvNetwork(
+            getattr(args, "num_region_layers", 1), args.dropout
+        )
 
         self.w_gate_geo = nn.Parameter(torch.FloatTensor(args.emb_dim, args.emb_dim))
         self.b_gate_geo = nn.Parameter(torch.FloatTensor(1, args.emb_dim))
@@ -138,6 +161,13 @@ class DCHL(nn.Module):
         self.region_attn_scale = float(getattr(args, "region_attn_scale", 1.0))
         self.region_gate_scale = float(getattr(args, "region_gate_scale", 1.0))
         self.gate_temp = max(float(getattr(args, "gate_temp", 1.0)), 1e-6)
+        self.use_region_branch = bool(getattr(args, "use_region_branch", 0))
+        self.use_location_branch = bool(getattr(args, "use_location_branch", 0))
+        alpha_init = float(getattr(args, "region_alpha_init", 0.1))
+        self.region_alpha_logit = nn.Parameter(torch.tensor(_safe_logit(alpha_init), dtype=torch.float))
+        self.use_region_encoder = bool(getattr(args, "use_region_encoder", 0))
+        self.use_dynamic_gate = bool(getattr(args, "use_dynamic_gate", 0))
+        self.use_cross_level_cl = bool(getattr(args, "use_cross_level_cl", 0))
 
         self.neighbor_query = nn.Linear(self.emb_dim * 2, self.emb_dim)
         self.neighbor_key = nn.Linear(self.emb_dim, self.emb_dim)
@@ -151,6 +181,11 @@ class DCHL(nn.Module):
         )
         nn.init.zeros_(self.region_view_gate[2].weight)
         nn.init.zeros_(self.region_view_gate[2].bias)
+        self.dynamic_gate = nn.Sequential(
+            nn.Linear(self.emb_dim * 3 + 2, self.emb_dim),
+            nn.ReLU(),
+            nn.Linear(self.emb_dim, 1)
+        )
 
         self.dropout = nn.Dropout(args.dropout)
 
@@ -191,6 +226,7 @@ class DCHL(nn.Module):
     def forward(self, dataset, batch):
         user_idx = batch["user_idx"].long().to(self.device)
         current_region = batch["current_region"].long().to(self.device)
+        last_poi = batch["last_poi"].long().to(self.device)
         neighbor_users = batch["neighbor_users"].long().to(self.device)     # [B, K]
         neighbor_mask = batch["neighbor_mask"].float().to(self.device)      # [B, K]
 
@@ -231,6 +267,7 @@ class DCHL(nn.Module):
         norm_hg_pois_embs = F.normalize(hg_pois_embs, p=2, dim=1)
         norm_geo_pois_embs = F.normalize(geo_pois_embs, p=2, dim=1)
         norm_trans_pois_embs = F.normalize(trans_pois_embs, p=2, dim=1)
+        base_poi_embs = (norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs) / 3.0
 
         norm_all_hg_users_embs = F.normalize(hg_structural_users_embs, p=2, dim=1)
         norm_hg_batch_users_embs = norm_all_hg_users_embs[user_idx]
@@ -242,58 +279,105 @@ class DCHL(nn.Module):
         region_emb = F.normalize(region_emb, p=2, dim=1)
         region_for_attn = region_emb * self.region_attn_scale
         region_for_gate = region_emb * self.region_gate_scale
+        cross_level_loss = torch.tensor(0.0, device=self.device)
 
-        # ===== 新增：区域约束用户邻居增强，只增强 HG 分支 =====
-        safe_neighbor_users = neighbor_users.clone()
-        safe_neighbor_users[safe_neighbor_users < 0] = 0
+        # baseline 用户表示
+        hg_user_final = norm_hg_batch_users_embs
 
-        neighbor_hg_embs = norm_all_hg_users_embs[safe_neighbor_users]   # [B, K, d]
+        # location 分支（残差增强，默认关闭）
+        if self.use_location_branch:
+            safe_neighbor_users = neighbor_users.clone()
+            safe_neighbor_users[safe_neighbor_users < 0] = 0
 
-        query = self.neighbor_query(
-            torch.cat([norm_hg_batch_users_embs, region_for_attn], dim=-1)
-        ).unsqueeze(1)  # [B, 1, d]
+            neighbor_hg_embs = norm_all_hg_users_embs[safe_neighbor_users]   # [B, K, d]
+            query = self.neighbor_query(
+                torch.cat([norm_hg_batch_users_embs, region_for_attn], dim=-1)
+            ).unsqueeze(1)  # [B, 1, d]
+            keys = self.neighbor_key(neighbor_hg_embs)        # [B, K, d]
+            values = self.neighbor_value(neighbor_hg_embs)    # [B, K, d]
 
-        keys = self.neighbor_key(neighbor_hg_embs)        # [B, K, d]
-        values = self.neighbor_value(neighbor_hg_embs)    # [B, K, d]
+            attn_scores = torch.sum(query * keys, dim=-1) / math.sqrt(self.emb_dim)  # [B, K]
+            attn_scores = attn_scores.masked_fill(neighbor_mask == 0, -1e9)
+            attn_weights = F.softmax(attn_scores, dim=-1)
 
-        attn_scores = torch.sum(query * keys, dim=-1) / math.sqrt(self.emb_dim)  # [B, K]
-        attn_scores = attn_scores.masked_fill(neighbor_mask == 0, -1e9)
-        attn_weights = F.softmax(attn_scores, dim=-1)
+            neighbor_ctx = torch.sum(attn_weights.unsqueeze(-1) * values, dim=1)  # [B, d]
+            has_neighbor = (neighbor_mask.sum(dim=1, keepdim=True) > 0).float()
+            neighbor_ctx = has_neighbor * neighbor_ctx
+            neighbor_ctx = F.normalize(neighbor_ctx, p=2, dim=1)
 
-        neighbor_ctx = torch.sum(attn_weights.unsqueeze(-1) * values, dim=1)  # [B, d]
-        has_neighbor = (neighbor_mask.sum(dim=1, keepdim=True) > 0).float()
-        neighbor_ctx = has_neighbor * neighbor_ctx
-        neighbor_ctx = F.normalize(neighbor_ctx, p=2, dim=1)
-
-        hg_user_final = F.normalize(
-            norm_hg_batch_users_embs + self.user_res_beta * neighbor_ctx,
-            p=2,
-            dim=1
-        )
+            hg_user_final = F.normalize(
+                norm_hg_batch_users_embs + self.user_res_beta * neighbor_ctx,
+                p=2,
+                dim=1
+            )
 
         # ===== 预测分数 =====
         pred_hg = hg_user_final @ norm_hg_pois_embs.T
         pred_geo = norm_geo_batch_users_embs @ norm_geo_pois_embs.T
         pred_trans = norm_trans_batch_users_embs @ norm_trans_pois_embs.T
 
-        # ===== 区域感知 softmax 残差融合 =====
-        gate_input = torch.cat([
-            hg_user_final,
-            norm_geo_batch_users_embs,
-            norm_trans_batch_users_embs,
-            region_for_gate
-        ], dim=-1)
-
-        gate_logits = self.region_view_gate(gate_input)
-        mix = torch.softmax(gate_logits / self.gate_temp, dim=-1)
-
         pred_base = (pred_hg + pred_geo + pred_trans) / 3.0
-        pred_region = (
-            mix[:, 0:1] * pred_hg +
-            mix[:, 1:2] * pred_geo +
-            mix[:, 2:3] * pred_trans
-        )
+        prediction = pred_base
 
-        prediction = pred_base + self.mix_beta * (pred_region - pred_base)
+        # legacy region branch switch keeps backward compatibility
+        if self.use_region_branch:
+            gate_input = torch.cat([
+                hg_user_final,
+                norm_geo_batch_users_embs,
+                norm_trans_batch_users_embs,
+                region_for_gate
+            ], dim=-1)
+            gate_logits = self.region_view_gate(gate_input)
+            mix = torch.softmax(gate_logits / self.gate_temp, dim=-1)
+            pred_region = (
+                mix[:, 0:1] * pred_hg +
+                mix[:, 1:2] * pred_geo +
+                mix[:, 2:3] * pred_trans
+            )
+            alpha_region = torch.sigmoid(self.region_alpha_logit)
+            prediction = pred_base + self.mix_beta * alpha_region * (pred_region - pred_base)
 
-        return prediction, loss_cl_poi, loss_cl_user
+        # === hierarchical POI-level + Region-level + Cross-level ===
+        if self.use_region_encoder:
+            region_embs = self.region_conv_network(self.region_embedding.weight, dataset.region_graph)
+            region_embs = F.normalize(region_embs, p=2, dim=1)
+
+            poi_region_ids = dataset.poi_region_ids
+            poi_region_embs = region_embs[poi_region_ids]  # [L, d]
+            poi_region_embs = F.normalize(poi_region_embs, p=2, dim=1)
+
+            if self.use_dynamic_gate:
+                batch_size = hg_user_final.size(0)
+                num_pois = base_poi_embs.size(0)
+
+                user_expand = hg_user_final.unsqueeze(1).expand(-1, num_pois, -1)
+                poi_expand = base_poi_embs.unsqueeze(0).expand(batch_size, -1, -1)
+                region_expand = poi_region_embs.unsqueeze(0).expand(batch_size, -1, -1)
+
+                # time interval proxy: sequence length normalized by dataset max length
+                seq_norm = batch["user_seq_len"].float().to(self.device) / max(float(dataset.max_user_seq_len), 1.0)
+                time_interval = seq_norm.unsqueeze(1).expand(-1, num_pois).unsqueeze(-1)
+
+                # distance interval proxy: absolute poi index gap normalized (no data split/eval changes)
+                poi_ids = torch.arange(num_pois, device=self.device).unsqueeze(0).expand(batch_size, -1)
+                dist_interval = (poi_ids - last_poi.unsqueeze(1)).abs().float() / max(float(self.num_pois), 1.0)
+                dist_interval = dist_interval.unsqueeze(-1)
+
+                gate_in = torch.cat([user_expand, poi_expand, region_expand, time_interval, dist_interval], dim=-1)
+                alpha = torch.sigmoid(self.dynamic_gate(gate_in)).squeeze(-1)  # [B, L]
+            else:
+                alpha = torch.sigmoid(self.region_alpha_logit) * torch.ones_like(pred_base)
+
+            cross_residual = poi_region_embs + base_poi_embs * poi_region_embs
+            cross_scores = torch.matmul(hg_user_final, cross_residual.T)
+            prediction = pred_base + self.mix_beta * alpha * cross_scores
+
+            if self.use_cross_level_cl:
+                pos_poi_emb = base_poi_embs[batch["label"].long().to(self.device)]
+                pos_region_id = poi_region_ids[batch["label"].long().to(self.device)]
+                pos_region_emb = region_embs[pos_region_id]
+                pos_score = torch.exp(torch.sum(pos_poi_emb * pos_region_emb, dim=-1) / self.ssl_temp)
+                all_region_score = torch.exp(torch.matmul(pos_poi_emb, region_embs[1:].T) / self.ssl_temp).sum(dim=-1)
+                cross_level_loss = torch.mean(-torch.log(pos_score / (all_region_score + 1e-8) + 1e-8))
+
+        return prediction, loss_cl_poi, loss_cl_user, cross_level_loss

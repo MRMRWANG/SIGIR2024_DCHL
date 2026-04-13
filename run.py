@@ -51,16 +51,21 @@ parser.add_argument('--lr_scheduler_factor', type=float, default=0.1, help='Lear
 parser.add_argument('--save_dir', type=str, default="logs")
 parser.add_argument('--region_bins', type=int, default=10)
 
-# 新增参数
+# 额外分支参数（默认关闭，保证 baseline 复现）
 parser.add_argument('--user_topk', type=int, default=10)
-# 略降默认强度，减轻区域分支对排序的扰动（可用命令行覆盖）
-parser.add_argument('--user_res_beta', type=float, default=0.08)
-parser.add_argument('--mix_beta', type=float, default=0.05)
-# 区域向量仅作轻量辅助：缩放后再进入邻居 query / 视图门控（1.0 等价于不缩放）
-parser.add_argument('--region_attn_scale', type=float, default=0.25)
-parser.add_argument('--region_gate_scale', type=float, default=0.25)
-# 视图门控 softmax 温度，>1 更平滑；1.0 与未除温度时等价
+parser.add_argument('--user_res_beta', type=float, default=0.15)
+parser.add_argument('--mix_beta', type=float, default=0.10)
+parser.add_argument('--region_attn_scale', type=float, default=1.0)
+parser.add_argument('--region_gate_scale', type=float, default=1.0)
 parser.add_argument('--gate_temp', type=float, default=1.0)
+parser.add_argument('--use_region_branch', type=int, default=0, help='0: off, 1: on')
+parser.add_argument('--use_location_branch', type=int, default=0, help='0: off, 1: on')
+parser.add_argument('--region_alpha_init', type=float, default=0.1)
+parser.add_argument('--num_region_layers', type=int, default=1)
+parser.add_argument('--use_region_encoder', type=int, default=0, help='ablation switch')
+parser.add_argument('--use_dynamic_gate', type=int, default=0, help='ablation switch')
+parser.add_argument('--use_cross_level_cl', type=int, default=0, help='ablation switch')
+parser.add_argument('--lambda_cross_cl', type=float, default=0.05)
 
 args = parser.parse_args()
 
@@ -184,16 +189,17 @@ def main():
             logging.info("Train. Batch {}/{}".format(idx, len(train_dataloader)))
             optimizer.zero_grad()
 
-            predictions, loss_cl_pois, loss_cl_users = model(train_dataset, batch)
+            predictions, loss_cl_pois, loss_cl_users, loss_cross_level = model(train_dataset, batch)
 
             loss_rec = criterion(predictions, batch["label"].to(device))
-            loss = loss_rec + args.lambda_cl * (loss_cl_pois + loss_cl_users)
+            loss = loss_rec + args.lambda_cl * (loss_cl_pois + loss_cl_users) + args.lambda_cross_cl * loss_cross_level
 
             logging.info(
-                "Train. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; loss: {:.4f}".format(
+                "Train. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; loss_cross: {:.4f}; loss: {:.4f}".format(
                     loss_rec.item(),
                     loss_cl_pois.item() if hasattr(loss_cl_pois, "item") else float(loss_cl_pois),
                     loss_cl_users.item() if hasattr(loss_cl_users, "item") else float(loss_cl_users),
+                    loss_cross_level.item() if hasattr(loss_cross_level, "item") else float(loss_cross_level),
                     loss.item()
                 )
             )
@@ -227,16 +233,17 @@ def main():
             for idx, batch in enumerate(test_dataloader):
                 logging.info("Test. Batch {}/{}".format(idx, len(test_dataloader)))
 
-                predictions, loss_cl_pois, loss_cl_users = model(test_dataset, batch)
+                predictions, loss_cl_pois, loss_cl_users, loss_cross_level = model(test_dataset, batch)
 
                 loss_rec = criterion(predictions, batch["label"].to(device))
-                loss = loss_rec + args.lambda_cl * (loss_cl_pois + loss_cl_users)
+                loss = loss_rec + args.lambda_cl * (loss_cl_pois + loss_cl_users) + args.lambda_cross_cl * loss_cross_level
 
                 logging.info(
-                    "Test. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; loss: {:.4f}".format(
+                    "Test. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; loss_cross: {:.4f}; loss: {:.4f}".format(
                         loss_rec.item(),
                         loss_cl_pois.item() if hasattr(loss_cl_pois, "item") else float(loss_cl_pois),
                         loss_cl_users.item() if hasattr(loss_cl_users, "item") else float(loss_cl_users),
+                        loss_cross_level.item() if hasattr(loss_cross_level, "item") else float(loss_cross_level),
                         loss.item()
                     )
                 )

@@ -147,7 +147,7 @@ def main():
 
             logging.info("Test. Batch {}/{}".format(idx, len(test_dataloader)))
 
-            predictions, loss_cl_users, loss_cl_pois = model(test_dataset, batch)
+            predictions, _, _, _ = model(test_dataset, batch)
 
             for k in Ks_list:
                 recall, ndcg = batch_performance(predictions.detach().cpu(), batch["label"].detach().cpu(), k)
