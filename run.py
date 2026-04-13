@@ -53,8 +53,14 @@ parser.add_argument('--region_bins', type=int, default=10)
 
 # 新增参数
 parser.add_argument('--user_topk', type=int, default=10)
-parser.add_argument('--user_res_beta', type=float, default=0.15)
-parser.add_argument('--mix_beta', type=float, default=0.10)
+# 略降默认强度，减轻区域分支对排序的扰动（可用命令行覆盖）
+parser.add_argument('--user_res_beta', type=float, default=0.08)
+parser.add_argument('--mix_beta', type=float, default=0.05)
+# 区域向量仅作轻量辅助：缩放后再进入邻居 query / 视图门控（1.0 等价于不缩放）
+parser.add_argument('--region_attn_scale', type=float, default=0.25)
+parser.add_argument('--region_gate_scale', type=float, default=0.25)
+# 视图门控 softmax 温度，>1 更平滑；1.0 与未除温度时等价
+parser.add_argument('--gate_temp', type=float, default=1.0)
 
 args = parser.parse_args()
 

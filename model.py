@@ -134,6 +134,10 @@ class DCHL(nn.Module):
         # 新增：区域约束相似邻居增强
         self.user_res_beta = args.user_res_beta
         self.mix_beta = args.mix_beta
+        # 区域辅助强度（未在 args 中给出时默认 1.0，兼容旧脚本）
+        self.region_attn_scale = float(getattr(args, "region_attn_scale", 1.0))
+        self.region_gate_scale = float(getattr(args, "region_gate_scale", 1.0))
+        self.gate_temp = max(float(getattr(args, "gate_temp", 1.0)), 1e-6)
 
         self.neighbor_query = nn.Linear(self.emb_dim * 2, self.emb_dim)
         self.neighbor_key = nn.Linear(self.emb_dim, self.emb_dim)
@@ -236,6 +240,8 @@ class DCHL(nn.Module):
         # 当前区域 embedding
         region_emb = self.region_embedding(current_region)
         region_emb = F.normalize(region_emb, p=2, dim=1)
+        region_for_attn = region_emb * self.region_attn_scale
+        region_for_gate = region_emb * self.region_gate_scale
 
         # ===== 新增：区域约束用户邻居增强，只增强 HG 分支 =====
         safe_neighbor_users = neighbor_users.clone()
@@ -244,7 +250,7 @@ class DCHL(nn.Module):
         neighbor_hg_embs = norm_all_hg_users_embs[safe_neighbor_users]   # [B, K, d]
 
         query = self.neighbor_query(
-            torch.cat([norm_hg_batch_users_embs, region_emb], dim=-1)
+            torch.cat([norm_hg_batch_users_embs, region_for_attn], dim=-1)
         ).unsqueeze(1)  # [B, 1, d]
 
         keys = self.neighbor_key(neighbor_hg_embs)        # [B, K, d]
@@ -275,10 +281,11 @@ class DCHL(nn.Module):
             hg_user_final,
             norm_geo_batch_users_embs,
             norm_trans_batch_users_embs,
-            region_emb
+            region_for_gate
         ], dim=-1)
 
-        mix = torch.softmax(self.region_view_gate(gate_input), dim=-1)
+        gate_logits = self.region_view_gate(gate_input)
+        mix = torch.softmax(gate_logits / self.gate_temp, dim=-1)
 
         pred_base = (pred_hg + pred_geo + pred_trans) / 3.0
         pred_region = (
