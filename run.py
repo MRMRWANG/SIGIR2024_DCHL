@@ -46,6 +46,21 @@ parser.add_argument('--keep_rate', type=float, default=1, help='ratio of edges t
 parser.add_argument('--keep_rate_poi', type=float, default=1, help='ratio of poi-poi directed edges to keep')  # 0.7
 parser.add_argument('--lr-scheduler-factor', type=float, default=0.1, help='Learning rate scheduler factor')
 parser.add_argument('--save_dir', type=str, default="logs")
+# Region residual calibration (optional; default off = original baseline)
+parser.add_argument('--use_region_calibration', type=int, default=0,
+                    help='1: pred = pred_base + alpha * region_score (else strict baseline)')
+parser.add_argument('--region_calib_alpha', type=float, default=0.05,
+                    help='Residual strength for region calibration (initial value)')
+parser.add_argument('--region_recent_k', type=int, default=10,
+                    help='Last K POIs in trajectory for recent region preference')
+parser.add_argument('--region_lat_bins', type=int, default=16)
+parser.add_argument('--region_lon_bins', type=int, default=16)
+parser.add_argument('--region_sim_type', type=str, default='dot', choices=['dot', 'cosine', 'mlp'])
+parser.add_argument('--use_dynamic_alpha_gate', type=int, default=0,
+                    help='1: learn per-user gate on alpha (requires use_region_calibration=1)')
+parser.add_argument('--lambda_region_reg', type=float, default=0.0,
+                    help='Contrastive regularizer on calibration module only (not cross-view CL)')
+parser.add_argument('--region_reg_temperature', type=float, default=0.1)
 args = parser.parse_args()
 
 # set random seed
@@ -159,13 +174,15 @@ def main():
             logging.info("Train. Batch {}/{}".format(idx, len(train_dataloader)))
             optimizer.zero_grad()
 
-            predictions, loss_cl_users, loss_cl_pois = model(train_dataset, batch)
+            predictions, loss_cl_users, loss_cl_pois, loss_region = model(train_dataset, batch)
 
             # calculate loss
             loss_rec = criterion(predictions, batch["label"].to(device))
             loss = loss_rec + args.lambda_cl * (loss_cl_pois + loss_cl_users)
+            loss = loss + args.lambda_region_reg * loss_region
             logging.info("Train. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; "
-                         "loss: {:.4f}".format(loss_rec.item(), loss_cl_pois, loss_cl_users, loss))
+                         "loss_region: {:.4f}; loss: {:.4f}".format(
+                             loss_rec.item(), loss_cl_pois, loss_cl_users, loss_region.item(), loss))
 
             loss.backward()
             optimizer.step()
@@ -197,13 +214,15 @@ def main():
 
                 logging.info("Test. Batch {}/{}".format(idx, len(test_dataloader)))
 
-                predictions, loss_cl_users, loss_cl_pois = model(test_dataset, batch)
+                predictions, loss_cl_users, loss_cl_pois, loss_region = model(test_dataset, batch)
 
                 # calculate loss
                 loss_rec = criterion(predictions, batch["label"].to(device))
                 loss = loss_rec + args.lambda_cl * (loss_cl_pois + loss_cl_users)
+                loss = loss + args.lambda_region_reg * loss_region
                 logging.info("Test. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; "
-                             "loss: {:.4f}".format(loss_rec.item(), loss_cl_pois, loss_cl_users, loss))
+                             "loss_region: {:.4f}; loss: {:.4f}".format(
+                                 loss_rec.item(), loss_cl_pois, loss_cl_users, loss_region.item(), loss))
 
                 test_loss += loss.item()
 

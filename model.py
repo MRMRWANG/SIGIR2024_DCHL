@@ -9,6 +9,126 @@ import torch
 import torch.nn.functional as F
 
 
+class RegionResidualCalibration(nn.Module):
+    """
+    Residual calibration on top of pred_base: final = pred_base + alpha * region_score.
+    Only constructed when use_region_calibration is enabled.
+    """
+
+    def __init__(self, args, num_regions, device):
+        super(RegionResidualCalibration, self).__init__()
+        self.emb_dim = args.emb_dim
+        self.device = device
+        self.recent_k = int(getattr(args, "region_recent_k", 10))
+        self.sim_type = getattr(args, "region_sim_type", "dot")
+        self.region_reg_temp = float(getattr(args, "region_reg_temperature", 0.1))
+        self.use_dynamic_alpha_gate = int(getattr(args, "use_dynamic_alpha_gate", 0))
+
+        self.region_embedding = nn.Embedding(num_regions, self.emb_dim)
+        nn.init.xavier_uniform_(self.region_embedding.weight)
+
+        init_alpha = float(getattr(args, "region_calib_alpha", 0.05))
+        self.alpha = nn.Parameter(torch.tensor(init_alpha, device=device))
+
+        if self.sim_type == "mlp":
+            self.user_proj = nn.Linear(self.emb_dim, self.emb_dim)
+            self.region_proj = nn.Linear(self.emb_dim, self.emb_dim)
+            nn.init.xavier_uniform_(self.user_proj.weight)
+            nn.init.xavier_uniform_(self.region_proj.weight)
+
+        if self.use_dynamic_alpha_gate:
+            gate_in = 2 * self.emb_dim
+            self.alpha_gate = nn.Sequential(
+                nn.Linear(gate_in, self.emb_dim),
+                nn.ReLU(),
+                nn.Linear(self.emb_dim, 1),
+            )
+            for m in self.alpha_gate:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+
+    def _recent_poi_region_pref(self, batch, poi_region_id):
+        """Aggregate region embeddings from the last K valid POIs in user_seq. [BS, D]"""
+        user_seq = batch["user_seq"]
+        lens = batch["user_seq_len"]
+        bsz = user_seq.size(0)
+        prefs = []
+        k = self.recent_k
+        for b in range(bsz):
+            L = int(lens[b].item())
+            if L <= 0:
+                prefs.append(torch.zeros(self.emb_dim, device=self.device))
+                continue
+            start = max(0, L - k)
+            idx = user_seq[b, start:L].long()
+            rid = poi_region_id[idx]
+            emb = self.region_embedding(rid).mean(dim=0)
+            prefs.append(emb)
+        return torch.stack(prefs, dim=0)
+
+    def _recent_poi_fusion_agg(self, batch, fusion_pois_embs):
+        """Mean of last K POI fusion embeddings (for dynamic alpha). [BS, D]"""
+        user_seq = batch["user_seq"]
+        lens = batch["user_seq_len"]
+        bsz = user_seq.size(0)
+        k = self.recent_k
+        out = []
+        for b in range(bsz):
+            L = int(lens[b].item())
+            if L <= 0:
+                out.append(torch.zeros(self.emb_dim, device=self.device))
+                continue
+            start = max(0, L - k)
+            idx = user_seq[b, start:L].long().clamp(max=fusion_pois_embs.size(0) - 1)
+            vec = fusion_pois_embs[idx].mean(dim=0)
+            out.append(vec)
+        return torch.stack(out, dim=0)
+
+    def region_similarity_scores(self, user_pref, poi_region_id):
+        """user_pref [BS, D], poi_region_id [L] -> scores [BS, L]"""
+        r_emb = self.region_embedding(poi_region_id)
+        if self.sim_type == "cosine":
+            u = F.normalize(user_pref, p=2, dim=1)
+            r = F.normalize(r_emb, p=2, dim=1)
+            return u @ r.T
+        if self.sim_type == "mlp":
+            u = self.user_proj(user_pref)
+            r = self.region_proj(r_emb)
+            return u @ r.T
+        return user_pref @ r_emb.T
+
+    def forward(self, pred_base, batch, dataset, fusion_batch_users_embs, fusion_pois_embs):
+        poi_region_id = dataset.poi_region_id
+        user_pref = self._recent_poi_region_pref(batch, poi_region_id)
+        region_scores = self.region_similarity_scores(user_pref, poi_region_id)
+
+        if self.use_dynamic_alpha_gate:
+            recent_fused = self._recent_poi_fusion_agg(batch, fusion_pois_embs)
+            gate_in = torch.cat([fusion_batch_users_embs, recent_fused], dim=-1)
+            gate = torch.sigmoid(self.alpha_gate(gate_in))
+            alpha_eff = self.alpha * gate
+            pred = pred_base + alpha_eff * region_scores
+        else:
+            pred = pred_base + self.alpha * region_scores
+        return pred, user_pref
+
+    def contrastive_region_loss(self, user_pref, label, poi_region_id):
+        """Optional regularization on region calibration path only."""
+        pos_rid = poi_region_id[label.long()]
+        pos_emb = self.region_embedding(pos_rid)
+        u = F.normalize(user_pref, p=2, dim=1)
+        p = F.normalize(pos_emb, p=2, dim=1)
+        pos_logits = torch.sum(u * p, dim=1) / self.region_reg_temp
+        neg_rid = torch.randint(
+            0, self.region_embedding.num_embeddings, (label.size(0),), device=self.device, dtype=torch.long
+        )
+        neg_emb = self.region_embedding(neg_rid)
+        n = F.normalize(neg_emb, p=2, dim=1)
+        neg_logits = torch.sum(u * n, dim=1) / self.region_reg_temp
+        loss = -torch.log(torch.sigmoid(pos_logits - neg_logits) + 1e-8)
+        return loss.mean()
+
+
 class MultiViewHyperConvLayer(nn.Module):
     """
     Multi-view Hypergraph Convolutional Layer
@@ -180,6 +300,12 @@ class DCHL(nn.Module):
         # dropout
         self.dropout = nn.Dropout(args.dropout)
 
+        # Optional: prediction-layer region residual (off by default; preserves original DCHL)
+        self.region_calib = None
+        if int(getattr(args, "use_region_calibration", 0)):
+            num_regions = int(getattr(args, "region_lat_bins", 16)) * int(getattr(args, "region_lon_bins", 16))
+            self.region_calib = RegionResidualCalibration(args, num_regions, device)
+
     @staticmethod
     def row_shuffle(embedding):
         corrupted_embedding = embedding[torch.randperm(embedding.size()[0])]
@@ -280,10 +406,19 @@ class DCHL(nn.Module):
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
         fusion_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
 
-        # prediction
+        # prediction (pred_base); optional region residual calibration on top
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
+        loss_region = torch.tensor(0.0, device=self.device)
+        if self.region_calib is not None:
+            prediction, user_pref = self.region_calib(
+                prediction, batch, dataset, fusion_batch_users_embs, fusion_pois_embs
+            )
+            if float(getattr(self.args, "lambda_region_reg", 0.0)) > 0.0:
+                loss_region = self.region_calib.contrastive_region_loss(
+                    user_pref, batch["label"], dataset.poi_region_id
+                )
 
-        return prediction, loss_cl_user, loss_cl_poi
+        return prediction, loss_cl_user, loss_cl_poi, loss_region
 
 
 

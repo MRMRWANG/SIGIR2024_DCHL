@@ -472,6 +472,28 @@ def sparse_adj_tensor_drop_edge(sp_adj, keep_rate):
     return torch.sparse.FloatTensor(newIdxs, newVals, sp_adj.shape)
 
 
+def build_poi_region_ids(pois_coos_dict, num_pois, lat_bins, lon_bins):
+    """
+    Assign each POI to a lat/lon grid cell (region). Used only when region calibration is enabled.
+    Returns np.ndarray of shape [num_pois] with dtype int64, values in [0, lat_bins * lon_bins - 1].
+    """
+    lats = []
+    lons = []
+    for pid in range(num_pois):
+        lat, lon = pois_coos_dict[pid]
+        lats.append(lat)
+        lons.append(lon)
+    lats = np.asarray(lats, dtype=np.float64)
+    lons = np.asarray(lons, dtype=np.float64)
+    lat_min, lat_max = lats.min(), lats.max()
+    lon_min, lon_max = lons.min(), lons.max()
+    eps = 1e-8
+    lat_idx = np.floor((lats - lat_min) / (lat_max - lat_min + eps) * lat_bins).clip(0, lat_bins - 1).astype(np.int64)
+    lon_idx = np.floor((lons - lon_min) / (lon_max - lon_min + eps) * lon_bins).clip(0, lon_bins - 1).astype(np.int64)
+    region_ids = lat_idx * lon_bins + lon_idx
+    return region_ids
+
+
 def csr_matrix_drop_edge(csr_adj_matrix, keep_rate):
     """Drop edge on scipy.sparse.csr_matrix"""
     if keep_rate == 1.0:

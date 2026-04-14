@@ -46,6 +46,15 @@ parser.add_argument('--keep_rate_poi', type=float, default=1, help='ratio of poi
 parser.add_argument('--lr-scheduler-factor', type=float, default=0.1, help='Learning rate scheduler factor')
 parser.add_argument('--save_dir', type=str, default="logs")
 parser.add_argument("--saved_model_path", type=str, default="20240118_231414")
+parser.add_argument('--use_region_calibration', type=int, default=0)
+parser.add_argument('--region_calib_alpha', type=float, default=0.05)
+parser.add_argument('--region_recent_k', type=int, default=10)
+parser.add_argument('--region_lat_bins', type=int, default=16)
+parser.add_argument('--region_lon_bins', type=int, default=16)
+parser.add_argument('--region_sim_type', type=str, default='dot', choices=['dot', 'cosine', 'mlp'])
+parser.add_argument('--use_dynamic_alpha_gate', type=int, default=0)
+parser.add_argument('--lambda_region_reg', type=float, default=0.0)
+parser.add_argument('--region_reg_temperature', type=float, default=0.1)
 args = parser.parse_args()
 
 # set random seed
@@ -147,7 +156,7 @@ def main():
 
             logging.info("Test. Batch {}/{}".format(idx, len(test_dataloader)))
 
-            predictions, loss_cl_users, loss_cl_pois = model(test_dataset, batch)
+            predictions, loss_cl_users, loss_cl_pois, _loss_region = model(test_dataset, batch)
 
             for k in Ks_list:
                 recall, ndcg = batch_performance(predictions.detach().cpu(), batch["label"].detach().cpu(), k)

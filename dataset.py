@@ -74,6 +74,17 @@ class POIDataset(Dataset):
         self.HG_poi_tar = self.Deg_H_poi_tar * self.H_poi_tar    # [L, L]
         self.HG_poi_tar = transform_csr_matrix_to_tensor(self.HG_poi_tar).to(device)
 
+        # Optional: region ids for residual calibration only (lazy; does not affect default baseline path)
+        self.use_region_calibration = int(getattr(args, "use_region_calibration", 0))
+        self.poi_region_id = None
+        self.num_regions = 0
+        if self.use_region_calibration:
+            lat_bins = int(getattr(args, "region_lat_bins", 16))
+            lon_bins = int(getattr(args, "region_lon_bins", 16))
+            region_ids = build_poi_region_ids(self.pois_coos_dict, num_pois, lat_bins, lon_bins)
+            self.poi_region_id = torch.from_numpy(region_ids).long().to(device)
+            self.num_regions = lat_bins * lon_bins
+
     def __len__(self):
         return self.num_users
 
