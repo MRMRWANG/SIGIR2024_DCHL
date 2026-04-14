@@ -78,10 +78,32 @@ parser.add_argument('--conf_gate_topk', type=int, default=20,
 parser.add_argument('--lambda_region_reg', type=float, default=0.0,
                     help='Contrastive regularizer on calibration module only (not cross-view CL)')
 parser.add_argument('--region_reg_temperature', type=float, default=0.1)
+parser.add_argument('--use_candidate_expansion', type=int, default=0,
+                    help='1: session-aware region candidate expansion residual')
+parser.add_argument('--expand_topr', type=int, default=5,
+                    help='Top-r predicted regions for candidate expansion')
+parser.add_argument('--expand_recent_k', type=int, default=-1,
+                    help='Recent K for session region intent; -1 uses region_recent_k')
+parser.add_argument('--expand_eta', type=float, default=0.01,
+                    help='Initial eta for candidate expansion score')
+parser.add_argument('--use_baseline_distill', type=int, default=0,
+                    help='1: distill final_score to preserve pred_base ranking')
+parser.add_argument('--lambda_distill', type=float, default=0.01,
+                    help='Weight of baseline-preserving distillation loss')
+parser.add_argument('--distill_tau', type=float, default=1.0,
+                    help='Temperature for KL distillation')
+parser.add_argument('--distill_rank_topk', type=int, default=20,
+                    help='Top-k teacher candidates for rank-preserving consistency')
+parser.add_argument('--distill_rank_margin', type=float, default=0.0,
+                    help='Pairwise margin for rank-preserving consistency')
+parser.add_argument('--distill_rank_weight', type=float, default=1.0,
+                    help='Weight of rank consistency term inside distillation loss')
 args = parser.parse_args()
 
 if args.user_sim_recent_k is not None and int(args.user_sim_recent_k) < 0:
     args.user_sim_recent_k = args.region_recent_k
+if args.expand_recent_k is not None and int(args.expand_recent_k) < 0:
+    args.expand_recent_k = args.region_recent_k
 
 # set random seed
 random.seed(args.seed)
@@ -194,15 +216,17 @@ def main():
             logging.info("Train. Batch {}/{}".format(idx, len(train_dataloader)))
             optimizer.zero_grad()
 
-            predictions, loss_cl_users, loss_cl_pois, loss_region = model(train_dataset, batch)
+            predictions, loss_cl_users, loss_cl_pois, loss_region, loss_distill = model(train_dataset, batch)
 
             # calculate loss
             loss_rec = criterion(predictions, batch["label"].to(device))
             loss = loss_rec + args.lambda_cl * (loss_cl_pois + loss_cl_users)
             loss = loss + args.lambda_region_reg * loss_region
+            loss = loss + args.lambda_distill * loss_distill
             logging.info("Train. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; "
-                         "loss_region: {:.4f}; loss: {:.4f}".format(
-                             loss_rec.item(), loss_cl_pois, loss_cl_users, loss_region.item(), loss))
+                         "loss_region: {:.4f}; loss_distill: {:.4f}; loss: {:.4f}".format(
+                             loss_rec.item(), loss_cl_pois, loss_cl_users, loss_region.item(),
+                             loss_distill.item(), loss))
 
             loss.backward()
             optimizer.step()
@@ -234,15 +258,17 @@ def main():
 
                 logging.info("Test. Batch {}/{}".format(idx, len(test_dataloader)))
 
-                predictions, loss_cl_users, loss_cl_pois, loss_region = model(test_dataset, batch)
+                predictions, loss_cl_users, loss_cl_pois, loss_region, loss_distill = model(test_dataset, batch)
 
                 # calculate loss
                 loss_rec = criterion(predictions, batch["label"].to(device))
                 loss = loss_rec + args.lambda_cl * (loss_cl_pois + loss_cl_users)
                 loss = loss + args.lambda_region_reg * loss_region
+                loss = loss + args.lambda_distill * loss_distill
                 logging.info("Test. loss_rec: {:.4f}; loss_cl_pois: {:.4f}; loss_cl_users: {:.4f}; "
-                             "loss_region: {:.4f}; loss: {:.4f}".format(
-                                 loss_rec.item(), loss_cl_pois, loss_cl_users, loss_region.item(), loss))
+                             "loss_region: {:.4f}; loss_distill: {:.4f}; loss: {:.4f}".format(
+                                 loss_rec.item(), loss_cl_pois, loss_cl_users, loss_region.item(),
+                                 loss_distill.item(), loss))
 
                 test_loss += loss.item()
 

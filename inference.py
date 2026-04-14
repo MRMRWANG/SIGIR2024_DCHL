@@ -64,10 +64,22 @@ parser.add_argument('--use_confidence_gate', type=int, default=0)
 parser.add_argument('--conf_gate_topk', type=int, default=20)
 parser.add_argument('--lambda_region_reg', type=float, default=0.0)
 parser.add_argument('--region_reg_temperature', type=float, default=0.1)
+parser.add_argument('--use_candidate_expansion', type=int, default=0)
+parser.add_argument('--expand_topr', type=int, default=5)
+parser.add_argument('--expand_recent_k', type=int, default=-1)
+parser.add_argument('--expand_eta', type=float, default=0.01)
+parser.add_argument('--use_baseline_distill', type=int, default=0)
+parser.add_argument('--lambda_distill', type=float, default=0.01)
+parser.add_argument('--distill_tau', type=float, default=1.0)
+parser.add_argument('--distill_rank_topk', type=int, default=20)
+parser.add_argument('--distill_rank_margin', type=float, default=0.0)
+parser.add_argument('--distill_rank_weight', type=float, default=1.0)
 args = parser.parse_args()
 
 if args.user_sim_recent_k is not None and int(args.user_sim_recent_k) < 0:
     args.user_sim_recent_k = args.region_recent_k
+if args.expand_recent_k is not None and int(args.expand_recent_k) < 0:
+    args.expand_recent_k = args.region_recent_k
 
 # set random seed
 random.seed(args.seed)
@@ -168,7 +180,7 @@ def main():
 
             logging.info("Test. Batch {}/{}".format(idx, len(test_dataloader)))
 
-            predictions, loss_cl_users, loss_cl_pois, _loss_region = model(test_dataset, batch)
+            predictions, loss_cl_users, loss_cl_pois, _loss_region, _loss_distill = model(test_dataset, batch)
 
             for k in Ks_list:
                 recall, ndcg = batch_performance(predictions.detach().cpu(), batch["label"].detach().cpu(), k)

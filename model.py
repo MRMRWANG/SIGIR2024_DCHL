@@ -48,6 +48,13 @@ class RegionResidualCalibration(nn.Module):
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
 
+        # Optional: session-aware region candidate expansion (off by default)
+        self.use_candidate_expansion = int(getattr(args, "use_candidate_expansion", 0))
+        self.expand_topr = int(getattr(args, "expand_topr", 5))
+        self.expand_recent_k = int(getattr(args, "expand_recent_k", self.recent_k))
+        init_expand_eta = float(getattr(args, "expand_eta", 0.01))
+        self.expand_eta = nn.Parameter(torch.tensor(init_expand_eta, device=device))
+
         self.region_embedding = nn.Embedding(num_regions, self.emb_dim)
         nn.init.xavier_uniform_(self.region_embedding.weight)
 
@@ -78,6 +85,25 @@ class RegionResidualCalibration(nn.Module):
         bsz = user_seq.size(0)
         prefs = []
         k = self.recent_k
+        for b in range(bsz):
+            L = int(lens[b].item())
+            if L <= 0:
+                prefs.append(torch.zeros(self.emb_dim, device=self.device))
+                continue
+            start = max(0, L - k)
+            idx = user_seq[b, start:L].long()
+            rid = poi_region_id[idx]
+            emb = self.region_embedding(rid).mean(dim=0)
+            prefs.append(emb)
+        return torch.stack(prefs, dim=0)
+
+    def _recent_poi_region_pref_with_k(self, batch, poi_region_id, recent_k):
+        """Aggregate region embeddings from the last recent_k valid POIs in user_seq. [BS, D]"""
+        user_seq = batch["user_seq"]
+        lens = batch["user_seq_len"]
+        bsz = user_seq.size(0)
+        prefs = []
+        k = max(1, int(recent_k))
         for b in range(bsz):
             L = int(lens[b].item())
             if L <= 0:
@@ -216,6 +242,26 @@ class RegionResidualCalibration(nn.Module):
         feats = torch.cat([gap, entropy, sess_len, reg_stab], dim=1)  # [BS,4]
         return torch.sigmoid(self.conf_gate(feats))  # [BS,1]
 
+    def _candidate_expand_score(self, batch, poi_region_id):
+        """
+        Session-aware candidate expansion score [BS, L]:
+        1) build session_region_intent from recent regions
+        2) predict top-r candidate regions
+        3) assign small positive score to POIs in those regions
+        """
+        session_region_intent = self._recent_poi_region_pref_with_k(
+            batch, poi_region_id, self.expand_recent_k
+        )  # [BS,D]
+        all_region_embs = self.region_embedding.weight  # [R,D]
+        region_logits = session_region_intent @ all_region_embs.T  # [BS,R]
+        topr = min(max(1, self.expand_topr), region_logits.size(1))
+        top_vals, top_idx = torch.topk(region_logits, k=topr, dim=1)  # [BS,topr]
+        top_probs = F.softmax(top_vals, dim=1)  # [BS,topr]
+        region_weights = torch.zeros_like(region_logits)  # [BS,R]
+        region_weights.scatter_(1, top_idx, top_probs)
+        expand_score = region_weights[:, poi_region_id.long()]  # [BS,L]
+        return expand_score
+
     def forward(self, pred_base, batch, dataset, fusion_batch_users_embs, fusion_pois_embs):
         poi_region_id = dataset.poi_region_id
         user_pref = self._recent_poi_region_pref(batch, poi_region_id)
@@ -240,6 +286,11 @@ class RegionResidualCalibration(nn.Module):
         if self.use_confidence_gate:
             gamma = self._confidence_gamma(pred_base, batch, poi_region_id)  # [BS,1]
             calibrated_scores = gamma * calibrated_scores
+
+        # optional candidate expansion score
+        if self.use_candidate_expansion:
+            expand_scores = self._candidate_expand_score(batch, poi_region_id)
+            calibrated_scores = calibrated_scores + self.expand_eta * expand_scores
 
         if self.use_region_rerank_only:
             # Re-rank only top-M candidates from pred_base; keep others unchanged.
@@ -449,6 +500,37 @@ class DCHL(nn.Module):
             num_regions = int(getattr(args, "region_lat_bins", 16)) * int(getattr(args, "region_lon_bins", 16))
             self.region_calib = RegionResidualCalibration(args, num_regions, device)
 
+        # Optional: baseline-preserving distillation (off by default)
+        self.use_baseline_distill = int(getattr(args, "use_baseline_distill", 0))
+        self.distill_tau = float(getattr(args, "distill_tau", 1.0))
+        self.distill_rank_topk = int(getattr(args, "distill_rank_topk", 20))
+        self.distill_rank_margin = float(getattr(args, "distill_rank_margin", 0.0))
+        self.distill_rank_weight = float(getattr(args, "distill_rank_weight", 1.0))
+
+    def baseline_preserving_distill_loss(self, teacher_pred, student_pred):
+        """
+        teacher = pred_base (detached), student = final score.
+        Combine KL consistency and rank-preserving consistency.
+        """
+        tau = max(1e-6, self.distill_tau)
+        t = teacher_pred.detach() / tau
+        s = student_pred / tau
+        kl_loss = F.kl_div(
+            F.log_softmax(s, dim=1),
+            F.softmax(t, dim=1),
+            reduction="batchmean",
+        ) * (tau ** 2)
+
+        topk = min(max(2, self.distill_rank_topk), teacher_pred.size(1))
+        top_teacher_idx = torch.topk(teacher_pred.detach(), k=topk, dim=1).indices
+        teacher_sorted_scores = torch.gather(teacher_pred.detach(), 1, top_teacher_idx)
+        teacher_order = torch.argsort(teacher_sorted_scores, dim=1, descending=True)
+        teacher_ordered_idx = torch.gather(top_teacher_idx, 1, teacher_order)
+        student_ordered_scores = torch.gather(student_pred, 1, teacher_ordered_idx)
+        pair_margin = student_ordered_scores[:, :-1] - student_ordered_scores[:, 1:]
+        rank_loss = F.relu(self.distill_rank_margin - pair_margin).mean()
+        return kl_loss + self.distill_rank_weight * rank_loss
+
     @staticmethod
     def row_shuffle(embedding):
         corrupted_embedding = embedding[torch.randperm(embedding.size()[0])]
@@ -549,19 +631,23 @@ class DCHL(nn.Module):
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
         fusion_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
 
-        # prediction (pred_base); optional region residual calibration on top
-        prediction = fusion_batch_users_embs @ fusion_pois_embs.T
+        # prediction (pred_base); optional residual modules on top
+        pred_base = fusion_batch_users_embs @ fusion_pois_embs.T
+        prediction = pred_base
         loss_region = torch.tensor(0.0, device=self.device)
+        loss_distill = torch.tensor(0.0, device=self.device)
         if self.region_calib is not None:
             prediction, user_pref = self.region_calib(
-                prediction, batch, dataset, fusion_batch_users_embs, fusion_pois_embs
+                pred_base, batch, dataset, fusion_batch_users_embs, fusion_pois_embs
             )
             if float(getattr(self.args, "lambda_region_reg", 0.0)) > 0.0:
                 loss_region = self.region_calib.contrastive_region_loss(
                     user_pref, batch["label"], dataset.poi_region_id
                 )
+            if self.use_baseline_distill:
+                loss_distill = self.baseline_preserving_distill_loss(pred_base, prediction)
 
-        return prediction, loss_cl_user, loss_cl_poi, loss_region
+        return prediction, loss_cl_user, loss_cl_poi, loss_region, loss_distill
 
 
 
