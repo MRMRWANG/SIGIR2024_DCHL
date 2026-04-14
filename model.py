@@ -23,6 +23,8 @@ class RegionResidualCalibration(nn.Module):
         self.sim_type = getattr(args, "region_sim_type", "dot")
         self.region_reg_temp = float(getattr(args, "region_reg_temperature", 0.1))
         self.use_dynamic_alpha_gate = int(getattr(args, "use_dynamic_alpha_gate", 0))
+        self.use_region_rerank_only = int(getattr(args, "use_region_rerank_only", 0))
+        self.region_rerank_topm = int(getattr(args, "region_rerank_topm", 50))
 
         self.region_embedding = nn.Embedding(num_regions, self.emb_dim)
         nn.init.xavier_uniform_(self.region_embedding.weight)
@@ -107,9 +109,22 @@ class RegionResidualCalibration(nn.Module):
             gate_in = torch.cat([fusion_batch_users_embs, recent_fused], dim=-1)
             gate = torch.sigmoid(self.alpha_gate(gate_in))
             alpha_eff = self.alpha * gate
-            pred = pred_base + alpha_eff * region_scores
+            calibrated_scores = alpha_eff * region_scores
         else:
-            pred = pred_base + self.alpha * region_scores
+            calibrated_scores = self.alpha * region_scores
+
+        if self.use_region_rerank_only:
+            # Re-rank only top-M candidates from pred_base; keep others unchanged.
+            topm = min(self.region_rerank_topm, pred_base.size(1))
+            if topm <= 0:
+                pred = pred_base
+            else:
+                _, topm_idx = torch.topk(pred_base, k=topm, dim=1)
+                rerank_delta = torch.zeros_like(pred_base)
+                rerank_delta.scatter_(1, topm_idx, calibrated_scores.gather(1, topm_idx))
+                pred = pred_base + rerank_delta
+        else:
+            pred = pred_base + calibrated_scores
         return pred, user_pref
 
     def contrastive_region_loss(self, user_pref, label, poi_region_id):

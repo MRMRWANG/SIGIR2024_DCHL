@@ -58,6 +58,10 @@ parser.add_argument('--region_lon_bins', type=int, default=16)
 parser.add_argument('--region_sim_type', type=str, default='dot', choices=['dot', 'cosine', 'mlp'])
 parser.add_argument('--use_dynamic_alpha_gate', type=int, default=0,
                     help='1: learn per-user gate on alpha (requires use_region_calibration=1)')
+parser.add_argument('--use_region_rerank_only', type=int, default=0,
+                    help='1: apply region residual only on pred_base top-M candidates')
+parser.add_argument('--region_rerank_topm', type=int, default=50,
+                    help='Top-M candidates selected by pred_base for rerank-only calibration')
 parser.add_argument('--lambda_region_reg', type=float, default=0.0,
                     help='Contrastive regularizer on calibration module only (not cross-view CL)')
 parser.add_argument('--region_reg_temperature', type=float, default=0.1)
