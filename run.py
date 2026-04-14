@@ -62,10 +62,26 @@ parser.add_argument('--use_region_rerank_only', type=int, default=0,
                     help='1: apply region residual only on pred_base top-M candidates')
 parser.add_argument('--region_rerank_topm', type=int, default=50,
                     help='Top-M candidates selected by pred_base for rerank-only calibration')
+parser.add_argument('--use_user_sim_residual', type=int, default=0,
+                    help='1: add short-term region-aware user similarity residual (beta * user_sim_score)')
+parser.add_argument('--user_sim_beta', type=float, default=0.02,
+                    help='Initial beta for user similarity residual')
+parser.add_argument('--user_sim_topm', type=int, default=50,
+                    help='Top-m similar users for user similarity residual')
+parser.add_argument('--user_sim_type', type=str, default='cosine', choices=['cosine', 'dot'])
+parser.add_argument('--user_sim_recent_k', type=int, default=-1,
+                    help='Recent K for building all-user short-term pref; -1 uses region_recent_k')
+parser.add_argument('--use_confidence_gate', type=int, default=0,
+                    help='1: gamma gate to scale total calibration residual based on pred_base confidence')
+parser.add_argument('--conf_gate_topk', type=int, default=20,
+                    help='Top-k used for confidence entropy feature')
 parser.add_argument('--lambda_region_reg', type=float, default=0.0,
                     help='Contrastive regularizer on calibration module only (not cross-view CL)')
 parser.add_argument('--region_reg_temperature', type=float, default=0.1)
 args = parser.parse_args()
+
+if args.user_sim_recent_k is not None and int(args.user_sim_recent_k) < 0:
+    args.user_sim_recent_k = args.region_recent_k
 
 # set random seed
 random.seed(args.seed)

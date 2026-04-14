@@ -26,6 +26,28 @@ class RegionResidualCalibration(nn.Module):
         self.use_region_rerank_only = int(getattr(args, "use_region_rerank_only", 0))
         self.region_rerank_topm = int(getattr(args, "region_rerank_topm", 50))
 
+        # Optional: short-term region-aware user similarity residual (off by default)
+        self.use_user_sim_residual = int(getattr(args, "use_user_sim_residual", 0))
+        self.user_sim_topm = int(getattr(args, "user_sim_topm", 50))
+        self.user_sim_type = getattr(args, "user_sim_type", "cosine")
+        self.user_sim_recent_k = int(getattr(args, "user_sim_recent_k", self.recent_k))
+        init_beta = float(getattr(args, "user_sim_beta", 0.02))
+        self.beta = nn.Parameter(torch.tensor(init_beta, device=device))
+
+        # Optional: confidence-aware adaptive gate gamma (off by default)
+        self.use_confidence_gate = int(getattr(args, "use_confidence_gate", 0))
+        self.conf_gate_topk = int(getattr(args, "conf_gate_topk", 20))
+        if self.use_confidence_gate:
+            # features: gap(top1-top5), entropy(topk), session_len, region_stability
+            self.conf_gate = nn.Sequential(
+                nn.Linear(4, 16),
+                nn.ReLU(),
+                nn.Linear(16, 1),
+            )
+            for m in self.conf_gate:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+
         self.region_embedding = nn.Embedding(num_regions, self.emb_dim)
         nn.init.xavier_uniform_(self.region_embedding.weight)
 
@@ -99,6 +121,101 @@ class RegionResidualCalibration(nn.Module):
             return u @ r.T
         return user_pref @ r_emb.T
 
+    def _all_users_recent_region_pref(self, dataset, poi_region_id, recent_k):
+        """
+        Build short-term region preference for all users from dataset.pad_all_train_sessions.
+        Returns [U, D]. This is used only when user-sim residual is enabled.
+        """
+        pad_seqs = dataset.pad_all_train_sessions  # [U, MAX_LEN]
+        padding_idx = dataset.padding_idx
+        num_users = pad_seqs.size(0)
+        prefs = []
+        for u in range(num_users):
+            seq = pad_seqs[u]
+            valid = seq != padding_idx
+            L = int(valid.sum().item())
+            if L <= 0:
+                prefs.append(torch.zeros(self.emb_dim, device=self.device))
+                continue
+            start = max(0, L - recent_k)
+            idx = seq[start:L].long()
+            rid = poi_region_id[idx]
+            prefs.append(self.region_embedding(rid).mean(dim=0))
+        return torch.stack(prefs, dim=0)
+
+    def _user_similarity_scores(self, batch_user_pref, all_user_pref):
+        """batch_user_pref [BS,D], all_user_pref [U,D] -> sim [BS,U]"""
+        if self.user_sim_type == "dot":
+            return batch_user_pref @ all_user_pref.T
+        # default cosine
+        bu = F.normalize(batch_user_pref, p=2, dim=1)
+        au = F.normalize(all_user_pref, p=2, dim=1)
+        return bu @ au.T
+
+    def _user_sim_score(self, batch, dataset, poi_region_id):
+        """
+        Compute user_sim_score [BS, L] by aggregating top-m similar users'
+        short-term region preference, then scoring candidate regions.
+        """
+        batch_user_pref = self._recent_poi_region_pref(batch, poi_region_id)  # [BS,D]
+        all_user_pref = self._all_users_recent_region_pref(dataset, poi_region_id, self.user_sim_recent_k)  # [U,D]
+
+        sim = self._user_similarity_scores(batch_user_pref, all_user_pref)  # [BS,U]
+        # exclude self
+        user_idx = batch["user_idx"].long().view(-1)
+        sim.scatter_(1, user_idx.unsqueeze(1), float("-inf"))
+
+        topm = min(self.user_sim_topm, sim.size(1))
+        if topm <= 0:
+            agg = torch.zeros_like(batch_user_pref)
+        else:
+            topv, topi = torch.topk(sim, k=topm, dim=1)
+            w = F.softmax(topv, dim=1)  # [BS,topm]
+            neigh = all_user_pref[topi]  # [BS,topm,D]
+            agg = torch.sum(neigh * w.unsqueeze(-1), dim=1)  # [BS,D]
+
+        r_emb = self.region_embedding(poi_region_id)  # [L,D]
+        return agg @ r_emb.T  # [BS,L]
+
+    def _region_stability(self, batch, poi_region_id):
+        """Fraction of unique regions in last K visits. Lower => more stable. [BS]"""
+        user_seq = batch["user_seq"]
+        lens = batch["user_seq_len"]
+        bsz = user_seq.size(0)
+        k = max(1, self.recent_k)
+        out = []
+        for b in range(bsz):
+            L = int(lens[b].item())
+            if L <= 0:
+                out.append(torch.tensor(1.0, device=self.device))
+                continue
+            start = max(0, L - k)
+            idx = user_seq[b, start:L].long()
+            rid = poi_region_id[idx]
+            uniq = int(torch.unique(rid).numel())
+            out.append(torch.tensor(uniq / max(1, rid.numel()), device=self.device))
+        return torch.stack(out, dim=0)
+
+    def _confidence_gamma(self, pred_base, batch, poi_region_id):
+        """
+        Compute gamma in [0,1] from pred_base confidence and short-term signals.
+        Features (per user):
+          gap: top1 - top5
+          entropy: softmax entropy over top-k
+          session_len: normalized
+          region_stability: unique_ratio(lastK)
+        """
+        topk = min(max(5, self.conf_gate_topk), pred_base.size(1))
+        vals, _ = torch.topk(pred_base, k=topk, dim=1)  # [BS,topk]
+        gap = (vals[:, 0] - vals[:, 4]).unsqueeze(1)  # [BS,1]
+        p = F.softmax(vals, dim=1)
+        entropy = (-torch.sum(p * torch.log(p + 1e-8), dim=1)).unsqueeze(1)  # [BS,1]
+        sess_len = batch["user_seq_len"].float()
+        sess_len = (sess_len / (sess_len.max().clamp_min(1.0))).unsqueeze(1)  # [BS,1]
+        reg_stab = self._region_stability(batch, poi_region_id).unsqueeze(1)  # [BS,1]
+        feats = torch.cat([gap, entropy, sess_len, reg_stab], dim=1)  # [BS,4]
+        return torch.sigmoid(self.conf_gate(feats))  # [BS,1]
+
     def forward(self, pred_base, batch, dataset, fusion_batch_users_embs, fusion_pois_embs):
         poi_region_id = dataset.poi_region_id
         user_pref = self._recent_poi_region_pref(batch, poi_region_id)
@@ -112,6 +229,17 @@ class RegionResidualCalibration(nn.Module):
             calibrated_scores = alpha_eff * region_scores
         else:
             calibrated_scores = self.alpha * region_scores
+
+        # optional user-sim residual
+        user_sim_scores = torch.zeros_like(pred_base)
+        if self.use_user_sim_residual:
+            user_sim_scores = self._user_sim_score(batch, dataset, poi_region_id)
+            calibrated_scores = calibrated_scores + self.beta * user_sim_scores
+
+        # optional confidence-aware gate gamma on total calibration residual
+        if self.use_confidence_gate:
+            gamma = self._confidence_gamma(pred_base, batch, poi_region_id)  # [BS,1]
+            calibrated_scores = gamma * calibrated_scores
 
         if self.use_region_rerank_only:
             # Re-rank only top-M candidates from pred_base; keep others unchanged.

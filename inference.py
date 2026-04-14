@@ -53,9 +53,21 @@ parser.add_argument('--region_lat_bins', type=int, default=16)
 parser.add_argument('--region_lon_bins', type=int, default=16)
 parser.add_argument('--region_sim_type', type=str, default='dot', choices=['dot', 'cosine', 'mlp'])
 parser.add_argument('--use_dynamic_alpha_gate', type=int, default=0)
+parser.add_argument('--use_region_rerank_only', type=int, default=0)
+parser.add_argument('--region_rerank_topm', type=int, default=50)
+parser.add_argument('--use_user_sim_residual', type=int, default=0)
+parser.add_argument('--user_sim_beta', type=float, default=0.02)
+parser.add_argument('--user_sim_topm', type=int, default=50)
+parser.add_argument('--user_sim_type', type=str, default='cosine', choices=['cosine', 'dot'])
+parser.add_argument('--user_sim_recent_k', type=int, default=-1)
+parser.add_argument('--use_confidence_gate', type=int, default=0)
+parser.add_argument('--conf_gate_topk', type=int, default=20)
 parser.add_argument('--lambda_region_reg', type=float, default=0.0)
 parser.add_argument('--region_reg_temperature', type=float, default=0.1)
 args = parser.parse_args()
+
+if args.user_sim_recent_k is not None and int(args.user_sim_recent_k) < 0:
+    args.user_sim_recent_k = args.region_recent_k
 
 # set random seed
 random.seed(args.seed)
