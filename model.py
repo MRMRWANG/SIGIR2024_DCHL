@@ -48,6 +48,22 @@ class RegionResidualCalibration(nn.Module):
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
 
+        # Optional: dual-branch adaptive fusion gate for user-sim and candidate-expansion
+        self.use_dual_branch_adaptive_fusion = int(getattr(args, "use_dual_branch_adaptive_fusion", 0))
+        self.dual_gate_topk = int(getattr(args, "dual_gate_topk", self.conf_gate_topk))
+        self.dual_gate_hidden = int(getattr(args, "dual_gate_hidden", 16))
+        self.dual_gate_max = float(getattr(args, "dual_gate_max", 0.2))
+        if self.use_dual_branch_adaptive_fusion:
+            # features: gap(top1-top5), entropy(topk), session_len, region_stability, recent_region_intent_norm
+            self.dual_gate = nn.Sequential(
+                nn.Linear(5, self.dual_gate_hidden),
+                nn.ReLU(),
+                nn.Linear(self.dual_gate_hidden, 2),
+            )
+            for m in self.dual_gate:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+
         # Optional: session-aware region candidate expansion (off by default)
         self.use_candidate_expansion = int(getattr(args, "use_candidate_expansion", 0))
         self.expand_topr = int(getattr(args, "expand_topr", 5))
@@ -262,6 +278,32 @@ class RegionResidualCalibration(nn.Module):
         expand_score = region_weights[:, poi_region_id.long()]  # [BS,L]
         return expand_score
 
+    def _dual_branch_gates(self, pred_base, batch, poi_region_id):
+        """
+        Confidence-aware gate outputs for two branches: g1 (user-sim), g2 (expand). [BS,1], [BS,1]
+        Input features:
+          - pred_base margin(top1-top5)
+          - pred_base top-k entropy
+          - session length (normalized)
+          - region stability
+          - recent region intent norm
+        """
+        topk = min(max(5, self.dual_gate_topk), pred_base.size(1))
+        vals, _ = torch.topk(pred_base, k=topk, dim=1)
+        gap = (vals[:, 0] - vals[:, 4]).unsqueeze(1)
+        p = F.softmax(vals, dim=1)
+        entropy = (-torch.sum(p * torch.log(p + 1e-8), dim=1)).unsqueeze(1)
+        sess_len = batch["user_seq_len"].float()
+        sess_len = (sess_len / (sess_len.max().clamp_min(1.0))).unsqueeze(1)
+        reg_stab = self._region_stability(batch, poi_region_id).unsqueeze(1)
+        recent_intent = self._recent_poi_region_pref(batch, poi_region_id)
+        recent_intent_norm = recent_intent.norm(dim=1, keepdim=True)
+        recent_intent_norm = recent_intent_norm / (recent_intent_norm.max().clamp_min(1e-6))
+        feats = torch.cat([gap, entropy, sess_len, reg_stab, recent_intent_norm], dim=1)  # [BS,5]
+        gate_raw = torch.sigmoid(self.dual_gate(feats))  # [BS,2]
+        gate = self.dual_gate_max * gate_raw
+        return gate[:, :1], gate[:, 1:]
+
     def forward(self, pred_base, batch, dataset, fusion_batch_users_embs, fusion_pois_embs):
         poi_region_id = dataset.poi_region_id
         user_pref = self._recent_poi_region_pref(batch, poi_region_id)
@@ -276,11 +318,23 @@ class RegionResidualCalibration(nn.Module):
         else:
             calibrated_scores = self.alpha * region_scores
 
-        # optional user-sim residual
+        # optional branch scores
         user_sim_scores = torch.zeros_like(pred_base)
+        expand_scores = torch.zeros_like(pred_base)
         if self.use_user_sim_residual:
             user_sim_scores = self._user_sim_score(batch, dataset, poi_region_id)
-            calibrated_scores = calibrated_scores + self.beta * user_sim_scores
+        if self.use_candidate_expansion:
+            expand_scores = self._candidate_expand_score(batch, poi_region_id)
+
+        # Optional dual-branch adaptive fusion:
+        # final_score = pred_base + region_residual + g1 * user_sim_score + g2 * expand_score
+        # Keep g1/g2 small via dual_gate_max to avoid damaging baseline.
+        if self.use_dual_branch_adaptive_fusion:
+            g1, g2 = self._dual_branch_gates(pred_base, batch, poi_region_id)  # [BS,1], [BS,1]
+            calibrated_scores = calibrated_scores + g1 * user_sim_scores + g2 * expand_scores
+        else:
+            if self.use_user_sim_residual:
+                calibrated_scores = calibrated_scores + self.beta * user_sim_scores
 
         # optional confidence-aware gate gamma on total calibration residual
         if self.use_confidence_gate:
@@ -288,8 +342,7 @@ class RegionResidualCalibration(nn.Module):
             calibrated_scores = gamma * calibrated_scores
 
         # optional candidate expansion score
-        if self.use_candidate_expansion:
-            expand_scores = self._candidate_expand_score(batch, poi_region_id)
+        if self.use_candidate_expansion and (not self.use_dual_branch_adaptive_fusion):
             calibrated_scores = calibrated_scores + self.expand_eta * expand_scores
 
         if self.use_region_rerank_only:
@@ -500,9 +553,8 @@ class DCHL(nn.Module):
             num_regions = int(getattr(args, "region_lat_bins", 16)) * int(getattr(args, "region_lon_bins", 16))
             self.region_calib = RegionResidualCalibration(args, num_regions, device)
 
-        # Optional: baseline-preserving distillation (off by default)
+        # Optional: baseline top-k consistency distillation (off by default)
         self.use_baseline_distill = int(getattr(args, "use_baseline_distill", 0))
-        self.distill_tau = float(getattr(args, "distill_tau", 1.0))
         self.distill_rank_topk = int(getattr(args, "distill_rank_topk", 20))
         self.distill_rank_margin = float(getattr(args, "distill_rank_margin", 0.0))
         self.distill_rank_weight = float(getattr(args, "distill_rank_weight", 1.0))
@@ -510,17 +562,8 @@ class DCHL(nn.Module):
     def baseline_preserving_distill_loss(self, teacher_pred, student_pred):
         """
         teacher = pred_base (detached), student = final score.
-        Combine KL consistency and rank-preserving consistency.
+        Top-k preserving consistency only (no full KL over all candidates).
         """
-        tau = max(1e-6, self.distill_tau)
-        t = teacher_pred.detach() / tau
-        s = student_pred / tau
-        kl_loss = F.kl_div(
-            F.log_softmax(s, dim=1),
-            F.softmax(t, dim=1),
-            reduction="batchmean",
-        ) * (tau ** 2)
-
         topk = min(max(2, self.distill_rank_topk), teacher_pred.size(1))
         top_teacher_idx = torch.topk(teacher_pred.detach(), k=topk, dim=1).indices
         teacher_sorted_scores = torch.gather(teacher_pred.detach(), 1, top_teacher_idx)
@@ -529,7 +572,7 @@ class DCHL(nn.Module):
         student_ordered_scores = torch.gather(student_pred, 1, teacher_ordered_idx)
         pair_margin = student_ordered_scores[:, :-1] - student_ordered_scores[:, 1:]
         rank_loss = F.relu(self.distill_rank_margin - pair_margin).mean()
-        return kl_loss + self.distill_rank_weight * rank_loss
+        return self.distill_rank_weight * rank_loss
 
     @staticmethod
     def row_shuffle(embedding):

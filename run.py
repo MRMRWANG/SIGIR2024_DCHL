@@ -75,6 +75,14 @@ parser.add_argument('--use_confidence_gate', type=int, default=0,
                     help='1: gamma gate to scale total calibration residual based on pred_base confidence')
 parser.add_argument('--conf_gate_topk', type=int, default=20,
                     help='Top-k used for confidence entropy feature')
+parser.add_argument('--use_dual_branch_adaptive_fusion', type=int, default=0,
+                    help='1: confidence-aware gate for user-sim and expansion branches')
+parser.add_argument('--dual_gate_topk', type=int, default=20,
+                    help='Top-k from pred_base for dual gate confidence features')
+parser.add_argument('--dual_gate_hidden', type=int, default=16,
+                    help='Hidden dim of dual gate MLP')
+parser.add_argument('--dual_gate_max', type=float, default=0.2,
+                    help='Upper bound scale for branch gates g1 and g2')
 parser.add_argument('--lambda_region_reg', type=float, default=0.0,
                     help='Contrastive regularizer on calibration module only (not cross-view CL)')
 parser.add_argument('--region_reg_temperature', type=float, default=0.1)
@@ -87,13 +95,11 @@ parser.add_argument('--expand_recent_k', type=int, default=-1,
 parser.add_argument('--expand_eta', type=float, default=0.01,
                     help='Initial eta for candidate expansion score')
 parser.add_argument('--use_baseline_distill', type=int, default=0,
-                    help='1: distill final_score to preserve pred_base ranking')
+                    help='1: apply top-k preserving consistency to keep pred_base order')
 parser.add_argument('--lambda_distill', type=float, default=0.01,
                     help='Weight of baseline-preserving distillation loss')
-parser.add_argument('--distill_tau', type=float, default=1.0,
-                    help='Temperature for KL distillation')
 parser.add_argument('--distill_rank_topk', type=int, default=20,
-                    help='Top-k teacher candidates for rank-preserving consistency')
+                    help='Top-k teacher candidates for consistency (e.g., 20 or 50)')
 parser.add_argument('--distill_rank_margin', type=float, default=0.0,
                     help='Pairwise margin for rank-preserving consistency')
 parser.add_argument('--distill_rank_weight', type=float, default=1.0,
