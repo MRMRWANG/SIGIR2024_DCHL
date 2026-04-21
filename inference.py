@@ -43,6 +43,8 @@ parser.add_argument('--num_di_layers', type=int, default=3,
 parser.add_argument('--temperature', type=float, default=0.1)
 parser.add_argument('--keep_rate', type=float, default=1, help='ratio of edges to keep')
 parser.add_argument('--keep_rate_poi', type=float, default=1, help='ratio of poi-poi directed edges to keep')  # 0.7
+parser.add_argument('--t_fusion_mode', type=str, default='gate', choices=['single', 'mean', 'gate'],
+                    help='T-branch fusion mode: single/mean/gate')
 parser.add_argument('--lr-scheduler-factor', type=float, default=0.1, help='Learning rate scheduler factor')
 parser.add_argument('--save_dir', type=str, default="logs")
 parser.add_argument("--saved_model_path", type=str, default="20240118_231414")

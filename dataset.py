@@ -67,12 +67,35 @@ class POIDataset(Dataset):
         self.Deg_H_poi_src = get_hyper_deg(self.H_poi_src)    # [L, L]
         self.HG_poi_src = self.Deg_H_poi_src * self.H_poi_src    # [L, L]
         self.HG_poi_src = transform_csr_matrix_to_tensor(self.HG_poi_src).to(device)
-
-        # generate targeted poi hypergraph
         self.H_poi_tar = self.H_poi_src.T    # [L, L]
         self.Deg_H_poi_tar = get_hyper_deg(self.H_poi_tar)    # [L, L]
         self.HG_poi_tar = self.Deg_H_poi_tar * self.H_poi_tar    # [L, L]
         self.HG_poi_tar = transform_csr_matrix_to_tensor(self.HG_poi_tar).to(device)
+
+        # split directed T-graph into near/far transitions using geo adjacency
+        geo_mask = self.poi_geo_adj.copy()
+        geo_mask.data = np.ones_like(geo_mask.data)
+        self.H_poi_src_near = self.H_poi_src.multiply(geo_mask).tocsr()
+        self.H_poi_src_far = (self.H_poi_src - self.H_poi_src_near).tocsr()
+
+        self.Deg_H_poi_src_near = get_hyper_deg(self.H_poi_src_near)    # [L, L]
+        self.HG_poi_src_near = self.Deg_H_poi_src_near * self.H_poi_src_near    # [L, L]
+        self.HG_poi_src_near = transform_csr_matrix_to_tensor(self.HG_poi_src_near).to(device)
+
+        self.Deg_H_poi_src_far = get_hyper_deg(self.H_poi_src_far)    # [L, L]
+        self.HG_poi_src_far = self.Deg_H_poi_src_far * self.H_poi_src_far    # [L, L]
+        self.HG_poi_src_far = transform_csr_matrix_to_tensor(self.HG_poi_src_far).to(device)
+
+        # generate targeted poi hypergraph for near/far branches
+        self.H_poi_tar_near = self.H_poi_src_near.T    # [L, L]
+        self.Deg_H_poi_tar_near = get_hyper_deg(self.H_poi_tar_near)    # [L, L]
+        self.HG_poi_tar_near = self.Deg_H_poi_tar_near * self.H_poi_tar_near    # [L, L]
+        self.HG_poi_tar_near = transform_csr_matrix_to_tensor(self.HG_poi_tar_near).to(device)
+
+        self.H_poi_tar_far = self.H_poi_src_far.T    # [L, L]
+        self.Deg_H_poi_tar_far = get_hyper_deg(self.H_poi_tar_far)    # [L, L]
+        self.HG_poi_tar_far = self.Deg_H_poi_tar_far * self.H_poi_tar_far    # [L, L]
+        self.HG_poi_tar_far = transform_csr_matrix_to_tensor(self.HG_poi_tar_far).to(device)
 
     def __len__(self):
         return self.num_users
@@ -140,12 +163,35 @@ class POISessionDataset(Dataset):
         self.Deg_H_poi_src = get_hyper_deg(self.H_poi_src)    # [L, L]
         self.HG_poi_src = self.Deg_H_poi_src * self.H_poi_src    # [L, L]
         self.HG_poi_src = transform_csr_matrix_to_tensor(self.HG_poi_src).to(device)
-
-        # generate targeted poi hypergraph
         self.H_poi_tar = self.H_poi_src.T    # [L, L]
         self.Deg_H_poi_tar = get_hyper_deg(self.H_poi_tar)    # [L, L]
         self.HG_poi_tar = self.Deg_H_poi_tar * self.H_poi_tar    # [L, L]
         self.HG_poi_tar = transform_csr_matrix_to_tensor(self.HG_poi_tar).to(device)
+
+        # split directed T-graph into near/far transitions using geo adjacency
+        geo_mask = self.poi_geo_adj.copy()
+        geo_mask.data = np.ones_like(geo_mask.data)
+        self.H_poi_src_near = self.H_poi_src.multiply(geo_mask).tocsr()
+        self.H_poi_src_far = (self.H_poi_src - self.H_poi_src_near).tocsr()
+
+        self.Deg_H_poi_src_near = get_hyper_deg(self.H_poi_src_near)    # [L, L]
+        self.HG_poi_src_near = self.Deg_H_poi_src_near * self.H_poi_src_near    # [L, L]
+        self.HG_poi_src_near = transform_csr_matrix_to_tensor(self.HG_poi_src_near).to(device)
+
+        self.Deg_H_poi_src_far = get_hyper_deg(self.H_poi_src_far)    # [L, L]
+        self.HG_poi_src_far = self.Deg_H_poi_src_far * self.H_poi_src_far    # [L, L]
+        self.HG_poi_src_far = transform_csr_matrix_to_tensor(self.HG_poi_src_far).to(device)
+
+        # generate targeted poi hypergraph for near/far branches
+        self.H_poi_tar_near = self.H_poi_src_near.T    # [L, L]
+        self.Deg_H_poi_tar_near = get_hyper_deg(self.H_poi_tar_near)    # [L, L]
+        self.HG_poi_tar_near = self.Deg_H_poi_tar_near * self.H_poi_tar_near    # [L, L]
+        self.HG_poi_tar_near = transform_csr_matrix_to_tensor(self.HG_poi_tar_near).to(device)
+
+        self.H_poi_tar_far = self.H_poi_src_far.T    # [L, L]
+        self.Deg_H_poi_tar_far = get_hyper_deg(self.H_poi_tar_far)    # [L, L]
+        self.HG_poi_tar_far = self.Deg_H_poi_tar_far * self.H_poi_tar_far    # [L, L]
+        self.HG_poi_tar_far = transform_csr_matrix_to_tensor(self.HG_poi_tar_far).to(device)
 
         # poi-session collaborative hypergraph
         self.H_poi_session = gen_sparse_H_pois_session(self.sessions_dict, num_pois, self.num_sessions)

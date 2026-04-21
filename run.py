@@ -44,6 +44,12 @@ parser.add_argument('--num_di_layers', type=int, default=3, help='layer number o
 parser.add_argument('--temperature', type=float, default=0.1)
 parser.add_argument('--keep_rate', type=float, default=1, help='ratio of edges to keep')
 parser.add_argument('--keep_rate_poi', type=float, default=1, help='ratio of poi-poi directed edges to keep')  # 0.7
+parser.add_argument('--t_fusion_mode', type=str, default='gate', choices=['single', 'mean', 'gate'],
+                    help='T-branch fusion mode: single/mean/gate')
+parser.add_argument('--debug_t_safety', action='store_true',
+                    help='enable debug checks for sequence/label leakage and gate stats')
+parser.add_argument('--debug_batches', type=int, default=3,
+                    help='number of initial train batches used for debug checks')
 parser.add_argument('--lr-scheduler-factor', type=float, default=0.1, help='Learning rate scheduler factor')
 parser.add_argument('--save_dir', type=str, default="logs")
 args = parser.parse_args()
@@ -145,6 +151,7 @@ def main():
 
     monitor_loss = float('inf')
     best_test_rec5 = 0.0
+    debug_printed = False
     for epoch in range(args.num_epochs):
         logging.info("================= Epoch {}/{} =================".format(epoch, args.num_epochs))
         start_time = time.time()
@@ -160,6 +167,28 @@ def main():
             optimizer.zero_grad()
 
             predictions, loss_cl_users, loss_cl_pois = model(train_dataset, batch)
+
+            if args.debug_t_safety and (not debug_printed) and idx < args.debug_batches:
+                user_seq = batch["user_seq"]
+                user_seq_len = batch["user_seq_len"]
+                label = batch["label"]
+                last_indices = torch.clamp(user_seq_len - 1, min=0).long().unsqueeze(1)
+                last_tokens = torch.gather(user_seq, dim=1, index=last_indices).squeeze(1)
+                match_ratio = (last_tokens == label).float().mean().item()
+
+                logging.info("[DEBUG][T-SAFETY] user_seq:\n{}".format(user_seq.detach().cpu().numpy()))
+                logging.info("[DEBUG][T-SAFETY] user_seq_len:\n{}".format(user_seq_len.detach().cpu().numpy()))
+                logging.info("[DEBUG][T-SAFETY] last_non_padding_token:\n{}".format(last_tokens.detach().cpu().numpy()))
+                logging.info("[DEBUG][T-SAFETY] label:\n{}".format(label.detach().cpu().numpy()))
+                logging.info("[DEBUG][T-SAFETY] last_token_eq_label_ratio: {:.6f}".format(match_ratio))
+
+                if args.t_fusion_mode == "gate" and model.last_alpha_stats is not None:
+                    logging.info("[DEBUG][T-GATE] alpha_mean: {:.6f}; alpha_var: {:.6f}".format(
+                        model.last_alpha_stats["mean"], model.last_alpha_stats["var"]
+                    ))
+
+                if idx == args.debug_batches - 1:
+                    debug_printed = True
 
             # calculate loss
             loss_rec = criterion(predictions, batch["label"].to(device))

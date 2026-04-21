@@ -7,6 +7,7 @@
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence
 
 
 class MultiViewHyperConvLayer(nn.Module):
@@ -81,7 +82,7 @@ class MultiViewHyperConvNetwork(nn.Module):
 
 
 class DirectedHyperConvNetwork(nn.Module):
-    def __init__(self, num_layers, device, dropout=0.3):
+    def __init__(self, num_layers, emb_dim, device, dropout=0.3):
         super(DirectedHyperConvNetwork, self).__init__()
 
         self.num_layers = num_layers
@@ -130,9 +131,11 @@ class DCHL(nn.Module):
         self.num_users = num_users
         self.num_pois = num_pois
         self.args = args
+        self.t_fusion_mode = getattr(args, "t_fusion_mode", "gate")
         self.device = device
         self.emb_dim = args.emb_dim
         self.ssl_temp = args.temperature
+        self.last_alpha_stats = None
 
         # embedding
         self.user_embedding = nn.Embedding(num_users, self.emb_dim)
@@ -145,7 +148,14 @@ class DCHL(nn.Module):
         # network
         self.mv_hconv_network = MultiViewHyperConvNetwork(args.num_mv_layers, args.emb_dim, 0, device)
         self.geo_conv_network = GeoConvNetwork(args.num_geo_layers, args.dropout)
-        self.di_hconv_network = DirectedHyperConvNetwork(args.num_di_layers, device, args.dropout)
+        self.di_hconv_network = DirectedHyperConvNetwork(args.num_di_layers, args.emb_dim, device, args.dropout)
+        self.trans_intent_gru = nn.GRU(self.emb_dim, self.emb_dim, batch_first=True)
+        self.trans_user_gate = nn.Sequential(
+            nn.Linear(3 * self.emb_dim, self.emb_dim),
+            nn.ReLU(),
+            nn.Linear(self.emb_dim, 1),
+            nn.Sigmoid()
+        )
 
         # gate for adaptive fusion with pois embeddings
         self.hyper_gate = nn.Sequential(nn.Linear(args.emb_dim, 1), nn.Sigmoid())
@@ -252,11 +262,56 @@ class DCHL(nn.Module):
         geo_structural_users_embs = torch.sparse.mm(dataset.HG_up, geo_pois_embs)
         geo_batch_users_embs = geo_structural_users_embs[batch["user_idx"]]  # [BS, d]
 
-        # poi-poi directed hypergraph
-        trans_pois_embs = self.di_hconv_network(seq_gate_pois_embs, dataset.HG_poi_src, dataset.HG_poi_tar)
-        # transition-aware user embeddings
-        trans_structural_users_embs = torch.sparse.mm(dataset.HG_up, trans_pois_embs)
-        trans_batch_users_embs = trans_structural_users_embs[batch["user_idx"]]  # [BS, d]
+        if self.t_fusion_mode == "single":
+            trans_pois_embs = self.di_hconv_network(
+                seq_gate_pois_embs, dataset.HG_poi_src, dataset.HG_poi_tar
+            )  # [L, d]
+            trans_structural_users_embs = torch.sparse.mm(dataset.HG_up, trans_pois_embs)  # [U, d]
+            trans_batch_users_embs = trans_structural_users_embs[batch["user_idx"]]  # [BS, d]
+        else:
+            # poi-poi directed hypergraph (near/far transitions)
+            trans_pois_embs_near = self.di_hconv_network(
+                seq_gate_pois_embs, dataset.HG_poi_src_near, dataset.HG_poi_tar_near
+            )  # [L, d]
+            trans_pois_embs_far = self.di_hconv_network(
+                seq_gate_pois_embs, dataset.HG_poi_src_far, dataset.HG_poi_tar_far
+            )  # [L, d]
+            trans_pois_embs = 0.5 * (trans_pois_embs_near + trans_pois_embs_far)  # [L, d]
+
+            # transition-aware user embeddings for near/far branches
+            trans_structural_users_embs_near = torch.sparse.mm(dataset.HG_up, trans_pois_embs_near)  # [U, d]
+            trans_structural_users_embs_far = torch.sparse.mm(dataset.HG_up, trans_pois_embs_far)  # [U, d]
+            trans_batch_users_embs_near = trans_structural_users_embs_near[batch["user_idx"]]  # [BS, d]
+            trans_batch_users_embs_far = trans_structural_users_embs_far[batch["user_idx"]]  # [BS, d]
+
+            if self.t_fusion_mode == "mean":
+                trans_batch_users_embs = 0.5 * (trans_batch_users_embs_near + trans_batch_users_embs_far)
+                self.last_alpha_stats = None
+            else:
+                # session-level implicit intent from historical prefix
+                user_seq = batch["user_seq"]  # [BS, S]
+                if user_seq.size(1) > 1:
+                    prefix_seq = user_seq[:, :-1]
+                else:
+                    prefix_seq = user_seq
+                prefix_lens = torch.clamp(batch["user_seq_len"] - 1, min=1)
+                prefix_lens = torch.clamp(prefix_lens, max=prefix_seq.size(1)).long()
+                prefix_embs = self.poi_embedding(prefix_seq)  # [BS, S', d]
+                packed_prefix = pack_padded_sequence(
+                    prefix_embs, prefix_lens.detach().cpu(), batch_first=True, enforce_sorted=False
+                )
+                _, hidden = self.trans_intent_gru(packed_prefix)
+                h_intent = hidden[-1]  # [BS, d]
+
+                # user-level dynamic gate for near/far transition fusion
+                alpha = self.trans_user_gate(
+                    torch.cat([trans_batch_users_embs_near, trans_batch_users_embs_far, h_intent], dim=1)
+                )  # [BS, 1]
+                trans_batch_users_embs = alpha * trans_batch_users_embs_near + (1 - alpha) * trans_batch_users_embs_far  # [BS, d]
+                self.last_alpha_stats = {
+                    "mean": alpha.detach().mean().item(),
+                    "var": alpha.detach().var(unbiased=False).item()
+                }
 
         # cross view contrastive learning
         loss_cl_poi = self.cal_loss_cl_pois(hg_pois_embs, geo_pois_embs, trans_pois_embs)
