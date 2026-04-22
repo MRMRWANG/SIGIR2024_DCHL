@@ -190,6 +190,27 @@ class DCHL(nn.Module):
         # dropout
         self.dropout = nn.Dropout(args.dropout)
 
+        # 上下文感知协同调制模块（CCM）：使用 user_seq 编码上下文并调制 collaborative 分支用户表示
+        self.ctx_gru = nn.GRU(
+            input_size=self.emb_dim,
+            hidden_size=self.emb_dim,
+            num_layers=1,
+            batch_first=True,
+        )
+        # 标量门控：输入 [c_u, h_ctx]，输出 g_C \in [0,1]，shape=[BS, 1]
+        self.ccm_gate = nn.Sequential(
+            nn.Linear(2 * self.emb_dim, self.emb_dim),
+            nn.ReLU(),
+            nn.Linear(self.emb_dim, 1),
+            nn.Sigmoid(),
+        )
+        # 固定融合系数 beta（第一版按需求固定为 0.7）
+        self.ccm_beta = 0.7
+        # 便于最小 ablation：True 使用 CCM，False 退化为原始 collaborative 分支
+        self.enable_ccm = True
+        # 记录 gate 统计量（debug）
+        self.ccm_debug_stats = {"g_C_mean": 0.0, "g_C_var": 0.0}
+
     @staticmethod
     def row_shuffle(embedding):
         corrupted_embedding = embedding[torch.randperm(embedding.size()[0])]
@@ -255,6 +276,32 @@ class DCHL(nn.Module):
         # hypergraph structure aware users embeddings
         hg_structural_users_embs = torch.sparse.mm(dataset.HG_up, hg_pois_embs)  # [U, d]
         hg_batch_users_embs = hg_structural_users_embs[batch["user_idx"]]  # [BS, d]
+
+        # CCM：在 collaborative 分支用户表示生成后、归一化前进行上下文感知调制
+        if self.enable_ccm:
+            # c_u: collaborative 分支用户表示 [BS, d]
+            c_u = hg_batch_users_embs
+            # user_seq 直接视作历史前缀序列，做 embedding 后输入 GRU
+            seq_embs = self.poi_embedding(batch["user_seq"])  # [BS, S, d]
+            seq_lens = batch["user_seq_len"].detach().cpu()
+            # pack 仅用于忽略 padding 的无效步，保持最小侵入不改 dataset
+            packed_seq_embs = pack_padded_sequence(seq_embs, seq_lens, batch_first=True, enforce_sorted=False)
+            _, h_n = self.ctx_gru(packed_seq_embs)
+            h_ctx = h_n[-1]  # [BS, d]
+
+            # g_C: 标量门控 [BS, 1]
+            g_C = self.ccm_gate(torch.cat([c_u, h_ctx], dim=1))
+            c_u_mod = g_C * c_u  # [BS, d]
+            c_u_final = self.ccm_beta * c_u + (1 - self.ccm_beta) * c_u_mod  # [BS, d]
+            hg_batch_users_embs = c_u_final
+
+            # 记录 gate 统计量便于 debug 观察
+            self.ccm_debug_stats["g_C_mean"] = g_C.mean().detach().item()
+            self.ccm_debug_stats["g_C_var"] = g_C.var(unbiased=False).detach().item()
+        else:
+            # 关闭 CCM 时，记录默认统计量，分支行为退化为原始模型
+            self.ccm_debug_stats["g_C_mean"] = 1.0
+            self.ccm_debug_stats["g_C_var"] = 0.0
 
         # poi-poi geographical graph convolutional network
         geo_pois_embs = self.geo_conv_network(geo_gate_pois_embs, dataset.poi_geo_graph)  # [L, d]
