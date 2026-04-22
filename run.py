@@ -28,7 +28,7 @@ torch.backends.cudnn.enabled = True
 # parse argument
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', default="NYC", help='NYC/TKY/Gowalla')
-parser.add_argument('--seed', default=2023, help='Random seed')
+parser.add_argument('--seed', type=int, default=2023, help='Random seed')
 parser.add_argument('--distance_threshold', default=2.5, type=float, help='distance threshold 2.5 or 0.25')
 parser.add_argument('--num_epochs', type=int, default=30, help='number of epochs')
 parser.add_argument('--batch_size', type=int, default=200, help='input batch size')
@@ -49,10 +49,10 @@ parser.add_argument('--save_dir', type=str, default="logs")
 args = parser.parse_args()
 
 # set random seed
-random.seed(args.seed)
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
-torch.cuda.manual_seed_all(args.seed)
+random.seed(int(args.seed))
+np.random.seed(int(args.seed))
+torch.manual_seed(int(args.seed))
+torch.cuda.manual_seed_all(int(args.seed))
 
 # set device gpu/cpu
 device = torch.device("cuda:{}".format(args.deviceID) if torch.cuda.is_available() else "cpu")
@@ -134,7 +134,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.decay)
     criterion = nn.CrossEntropyLoss().to(device)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 'min', verbose=True, factor=args.lr_scheduler_factor)
+        optimizer, 'min', factor=args.lr_scheduler_factor)
 
     # Train
     logging.info("5. Start Training")
