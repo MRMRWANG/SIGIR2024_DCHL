@@ -44,12 +44,53 @@ class MultiViewHyperConvLayer(nn.Module):
 class DirectedHyperConvLayer(nn.Module):
     """Directed hypergraph convolutional layer"""
 
-    def __init__(self):
+    def __init__(self, alpha_t=0.1):
         super(DirectedHyperConvLayer, self).__init__()
+        self.alpha_t = alpha_t
+        self.last_debug_stats = {}
+
+    def _refine_sparse_adj(self, pois_embs, sparse_adj, stats_prefix):
+        """
+        Refine existing sparse edges only (no densification).
+        """
+        sparse_adj = sparse_adj.coalesce()
+        edge_index = sparse_adj.indices()      # [2, E]
+        base_val = sparse_adj.values()         # [E]
+
+        src_idx = edge_index[0]
+        tar_idx = edge_index[1]
+        src_emb = pois_embs[src_idx]           # [E, d]
+        tar_emb = pois_embs[tar_idx]           # [E, d]
+
+        sim = F.cosine_similarity(src_emb, tar_emb, dim=1)       # [-1, 1], [E]
+        sim_norm = ((sim + 1.0) * 0.5).clamp(0.0, 1.0)           # [0, 1], [E]
+        refined_val = base_val * (1.0 + self.alpha_t * sim_norm) # residual refinement
+
+        # debug stats for inspection
+        eps = 1e-8
+        self.last_debug_stats[f"sim_{stats_prefix}_mean"] = sim.mean().detach().item()
+        self.last_debug_stats[f"sim_{stats_prefix}_var"] = sim.var(unbiased=False).detach().item()
+        self.last_debug_stats[f"refined_val_{stats_prefix}_over_base_mean"] = (
+            (refined_val.mean() / (base_val.mean() + eps)).detach().item()
+        )
+
+        refined_adj = torch.sparse_coo_tensor(
+            edge_index,
+            refined_val,
+            sparse_adj.shape,
+            device=refined_val.device,
+            dtype=refined_val.dtype,
+        ).coalesce()
+
+        return refined_adj
 
     def forward(self, pois_embs, HG_poi_src, HG_poi_tar):
-        msg_tar = torch.sparse.mm(HG_poi_tar, pois_embs)
-        msg_src = torch.sparse.mm(HG_poi_src, msg_tar)
+        # refine edge weights on existing sparse edges only
+        refined_HG_poi_src = self._refine_sparse_adj(pois_embs, HG_poi_src, "src")
+        refined_HG_poi_tar = self._refine_sparse_adj(pois_embs, HG_poi_tar, "tar")
+
+        msg_tar = torch.sparse.mm(refined_HG_poi_tar, pois_embs)
+        msg_src = torch.sparse.mm(refined_HG_poi_src, msg_tar)
 
         return msg_src
 
@@ -81,18 +122,20 @@ class MultiViewHyperConvNetwork(nn.Module):
 
 
 class DirectedHyperConvNetwork(nn.Module):
-    def __init__(self, num_layers, device, dropout=0.3):
+    def __init__(self, num_layers, device, dropout=0.3, alpha_t=0.1):
         super(DirectedHyperConvNetwork, self).__init__()
 
         self.num_layers = num_layers
         self.device = device
         self.dropout = dropout
-        self.di_hconv_layer = DirectedHyperConvLayer()
+        self.di_hconv_layer = DirectedHyperConvLayer(alpha_t=alpha_t)
+        self.last_debug_stats = {}
 
     def forward(self, pois_embs, HG_poi_src, HG_poi_tar):
         final_pois_embs = [pois_embs]
         for layer_idx in range(self.num_layers):
             pois_embs = self.di_hconv_layer(pois_embs, HG_poi_src, HG_poi_tar)
+            self.last_debug_stats = dict(self.di_hconv_layer.last_debug_stats)
             # add residual connection
             pois_embs = pois_embs + final_pois_embs[-1]
             pois_embs = F.dropout(pois_embs, self.dropout)
@@ -142,10 +185,18 @@ class DCHL(nn.Module):
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.poi_embedding.weight)
 
+        # temporal branch edge refinement strength
+        self.alpha_t = 0.1
+
         # network
         self.mv_hconv_network = MultiViewHyperConvNetwork(args.num_mv_layers, args.emb_dim, 0, device)
         self.geo_conv_network = GeoConvNetwork(args.num_geo_layers, args.dropout)
-        self.di_hconv_network = DirectedHyperConvNetwork(args.num_di_layers, device, args.dropout)
+        self.di_hconv_network = DirectedHyperConvNetwork(
+            args.num_di_layers,
+            device,
+            args.dropout,
+            alpha_t=self.alpha_t,
+        )
 
         # gate for adaptive fusion with pois embeddings
         self.hyper_gate = nn.Sequential(nn.Linear(args.emb_dim, 1), nn.Sigmoid())
