@@ -162,6 +162,19 @@ class DCHL(nn.Module):
         self.w_2 = nn.Parameter(torch.Tensor(self.emb_dim, 1))
         self.glu1 = nn.Linear(self.emb_dim, self.emb_dim)
         self.glu2 = nn.Linear(self.emb_dim, self.emb_dim, bias=False)
+        self.ctx_gru = nn.GRU(input_size=self.emb_dim, hidden_size=self.emb_dim, batch_first=True)
+        self.mlp_gamma = nn.Sequential(
+            nn.Linear(2 * self.emb_dim, self.emb_dim),
+            nn.ReLU(),
+            nn.Linear(self.emb_dim, self.emb_dim)
+        )
+        self.mlp_delta = nn.Sequential(
+            nn.Linear(2 * self.emb_dim, self.emb_dim),
+            nn.ReLU(),
+            nn.Linear(self.emb_dim, self.emb_dim)
+        )
+        self.ccm_beta = 0.7
+        self.ccm_debug_stats = {}
 
         # gating before disentangled learning
         self.w_gate_geo = nn.Parameter(torch.FloatTensor(args.emb_dim, args.emb_dim))
@@ -245,6 +258,21 @@ class DCHL(nn.Module):
         # hypergraph structure aware users embeddings
         hg_structural_users_embs = torch.sparse.mm(dataset.HG_up, hg_pois_embs)  # [U, d]
         hg_batch_users_embs = hg_structural_users_embs[batch["user_idx"]]  # [BS, d]
+        c_u = hg_batch_users_embs
+        seq_embs = self.poi_embedding(batch["user_seq"])  # [BS, S, d]
+        _, h_n = self.ctx_gru(seq_embs)
+        h_ctx = h_n.squeeze(0)  # [BS, d]
+        ccm_input = torch.cat([c_u, h_ctx], dim=1)  # [BS, 2d]
+        gamma = torch.sigmoid(self.mlp_gamma(ccm_input))  # [BS, d]
+        delta = self.mlp_delta(ccm_input)  # [BS, d]
+        c_u_mod = gamma * c_u + delta
+        hg_batch_users_embs = self.ccm_beta * c_u + (1 - self.ccm_beta) * c_u_mod
+        self.ccm_debug_stats = {
+            "gamma_mean": gamma.mean().detach(),
+            "gamma_var": gamma.var(unbiased=False).detach(),
+            "delta_mean": delta.mean().detach(),
+            "delta_var": delta.var(unbiased=False).detach(),
+        }
 
         # poi-poi geographical graph convolutional network
         geo_pois_embs = self.geo_conv_network(geo_gate_pois_embs, dataset.poi_geo_graph)  # [L, d]
