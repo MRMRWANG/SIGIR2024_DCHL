@@ -169,6 +169,8 @@ class DCHL(nn.Module):
         self.ccm_beta = 0.7  # 固定 beta，不引入新超参搜索
         # 记录 g_C 的统计量，供训练/调试查看（不改 forward 返回签名）
         self.ccm_gate_stats = {"mean": 0.0, "var": 0.0}
+        # debug: 控制只打印一次 CCM 与融合权重统计
+        self._ccm_debug_printed = False
 
         # temporal-augmentation
         self.pos_embeddings = nn.Embedding(1500, self.emb_dim, padding_idx=0)
@@ -276,6 +278,7 @@ class DCHL(nn.Module):
         # 记录 g_C 的均值/方差，便于 debug 观察门控是否塌陷
         self.ccm_gate_stats["mean"] = g_C.detach().mean().item()
         self.ccm_gate_stats["var"] = g_C.detach().var(unbiased=False).item()
+        ccm_gate_var_dim1_mean = g_C.detach().var(dim=1, unbiased=False).mean().item()
 
         # poi-poi geographical graph convolutional network
         geo_pois_embs = self.geo_conv_network(geo_gate_pois_embs, dataset.poi_geo_graph)  # [L, d]
@@ -306,6 +309,21 @@ class DCHL(nn.Module):
         hyper_coef = self.hyper_gate(norm_hg_batch_users_embs)
         geo_coef = self.gcn_gate(norm_geo_batch_users_embs)
         trans_coef = self.trans_gate(norm_trans_batch_users_embs)
+        # debug: 只打印一次，确认 beta 是否切换、门控是否塌陷、协同分支融合权重是否过低
+        if not self._ccm_debug_printed:
+            print(
+                "[CCM-DEBUG] beta={:.4f} | g_C.mean={:.6f} | g_C.var={:.6f} | g_C.var_dim1_mean={:.6f} | "
+                "hyper_coef.mean={:.6f} | geo_coef.mean={:.6f} | trans_coef.mean={:.6f}".format(
+                    self.ccm_beta,
+                    self.ccm_gate_stats["mean"],
+                    self.ccm_gate_stats["var"],
+                    ccm_gate_var_dim1_mean,
+                    hyper_coef.detach().mean().item(),
+                    geo_coef.detach().mean().item(),
+                    trans_coef.detach().mean().item()
+                )
+            )
+            self._ccm_debug_printed = True
 
         # final fusion for user and poi embeddings
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
