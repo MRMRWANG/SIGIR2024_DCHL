@@ -158,12 +158,12 @@ class DCHL(nn.Module):
         self.user_gcn_gate = nn.Sequential(nn.Linear(args.emb_dim, 1), nn.Sigmoid())
 
         # CCM: 上下文感知协同调制模块（最小版本）
-        # 用 user_seq 的历史前缀编码上下文向量 h_ctx，再对 collaborative user 表示做标量门控
+        # 用 user_seq 的历史前缀编码上下文向量 h_ctx，再对 collaborative user 表示做逐维门控
         self.ccm_gru = nn.GRU(input_size=self.emb_dim, hidden_size=self.emb_dim, num_layers=1, batch_first=True)
         self.ccm_gate = nn.Sequential(
             nn.Linear(2 * args.emb_dim, args.emb_dim),
             nn.ReLU(),
-            nn.Linear(args.emb_dim, 1),
+            nn.Linear(args.emb_dim, args.emb_dim),
             nn.Sigmoid()
         )
         self.ccm_beta = 0.7  # 固定 beta，不引入新超参搜索
@@ -268,8 +268,8 @@ class DCHL(nn.Module):
         packed_seq_embs = pack_padded_sequence(batch_user_seq_embs, batch_user_seq_len, batch_first=True, enforce_sorted=False)
         _, h_n = self.ccm_gru(packed_seq_embs)
         h_ctx = h_n[-1]  # [BS, d]
-        # 标量门控 g_C，第一版输出 [BS, 1]
-        g_C = self.ccm_gate(torch.cat([c_u, h_ctx], dim=1))  # [BS, 1]
+        # 逐维门控 g_C，输出 [BS, d]，避免归一化后被整体缩放抵消
+        g_C = self.ccm_gate(torch.cat([c_u, h_ctx], dim=1))  # [BS, d]
         c_u_mod = g_C * c_u  # [BS, d]
         c_u_final = self.ccm_beta * c_u + (1 - self.ccm_beta) * c_u_mod  # [BS, d]
         hg_batch_users_embs = c_u_final
