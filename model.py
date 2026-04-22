@@ -7,6 +7,7 @@
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence
 
 
 class MultiViewHyperConvLayer(nn.Module):
@@ -156,6 +157,19 @@ class DCHL(nn.Module):
         self.user_hyper_gate = nn.Sequential(nn.Linear(args.emb_dim, 1), nn.Sigmoid())
         self.user_gcn_gate = nn.Sequential(nn.Linear(args.emb_dim, 1), nn.Sigmoid())
 
+        # CCM: 上下文感知协同调制模块（最小版本）
+        # 用 user_seq 的历史前缀编码上下文向量 h_ctx，再对 collaborative user 表示做标量门控
+        self.ccm_gru = nn.GRU(input_size=self.emb_dim, hidden_size=self.emb_dim, num_layers=1, batch_first=True)
+        self.ccm_gate = nn.Sequential(
+            nn.Linear(2 * args.emb_dim, args.emb_dim),
+            nn.ReLU(),
+            nn.Linear(args.emb_dim, 1),
+            nn.Sigmoid()
+        )
+        self.ccm_beta = 0.7  # 固定 beta，不引入新超参搜索
+        # 记录 g_C 的统计量，供训练/调试查看（不改 forward 返回签名）
+        self.ccm_gate_stats = {"mean": 0.0, "var": 0.0}
+
         # temporal-augmentation
         self.pos_embeddings = nn.Embedding(1500, self.emb_dim, padding_idx=0)
         self.w_1 = nn.Linear(2 * self.emb_dim, self.emb_dim)
@@ -245,6 +259,23 @@ class DCHL(nn.Module):
         # hypergraph structure aware users embeddings
         hg_structural_users_embs = torch.sparse.mm(dataset.HG_up, hg_pois_embs)  # [U, d]
         hg_batch_users_embs = hg_structural_users_embs[batch["user_idx"]]  # [BS, d]
+        # CCM: collaborative user 表示（c_u）在归一化前进行上下文感知调制
+        c_u = hg_batch_users_embs  # [BS, d]
+        # user_seq 已是纯历史序列，直接用完整 user_seq 做 GRU 编码
+        batch_user_seq_embs = self.poi_embedding(batch["user_seq"])  # [BS, S, d]
+        batch_user_seq_len = batch["user_seq_len"].detach().cpu()
+        # pack 以忽略 padding 对 GRU 状态的干扰
+        packed_seq_embs = pack_padded_sequence(batch_user_seq_embs, batch_user_seq_len, batch_first=True, enforce_sorted=False)
+        _, h_n = self.ccm_gru(packed_seq_embs)
+        h_ctx = h_n[-1]  # [BS, d]
+        # 标量门控 g_C，第一版输出 [BS, 1]
+        g_C = self.ccm_gate(torch.cat([c_u, h_ctx], dim=1))  # [BS, 1]
+        c_u_mod = g_C * c_u  # [BS, d]
+        c_u_final = self.ccm_beta * c_u + (1 - self.ccm_beta) * c_u_mod  # [BS, d]
+        hg_batch_users_embs = c_u_final
+        # 记录 g_C 的均值/方差，便于 debug 观察门控是否塌陷
+        self.ccm_gate_stats["mean"] = g_C.detach().mean().item()
+        self.ccm_gate_stats["var"] = g_C.detach().var(unbiased=False).item()
 
         # poi-poi geographical graph convolutional network
         geo_pois_embs = self.geo_conv_network(geo_gate_pois_embs, dataset.poi_geo_graph)  # [L, d]
