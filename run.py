@@ -172,15 +172,17 @@ def main():
                 user_seq = batch["user_seq"]
                 user_seq_len = batch["user_seq_len"]
                 label = batch["label"]
+                # Use user_seq_len to get the last valid token (padding value is not assumed to be 0)
                 last_indices = torch.clamp(user_seq_len - 1, min=0).long().unsqueeze(1)
-                last_tokens = torch.gather(user_seq, dim=1, index=last_indices).squeeze(1)
-                match_ratio = (last_tokens == label).float().mean().item()
+                last_token = torch.gather(user_seq, dim=1, index=last_indices).squeeze(1)
+                last_non_padding_token = last_token
+                last_token_eq_label_ratio = (last_token == label).float().mean().item()
 
                 logging.info("[DEBUG][T-SAFETY] user_seq:\n{}".format(user_seq.detach().cpu().numpy()))
                 logging.info("[DEBUG][T-SAFETY] user_seq_len:\n{}".format(user_seq_len.detach().cpu().numpy()))
-                logging.info("[DEBUG][T-SAFETY] last_non_padding_token:\n{}".format(last_tokens.detach().cpu().numpy()))
+                logging.info("[DEBUG][T-SAFETY] last_non_padding_token:\n{}".format(last_non_padding_token.detach().cpu().numpy()))
                 logging.info("[DEBUG][T-SAFETY] label:\n{}".format(label.detach().cpu().numpy()))
-                logging.info("[DEBUG][T-SAFETY] last_token_eq_label_ratio: {:.6f}".format(match_ratio))
+                logging.info("[DEBUG][T-SAFETY] last_token_eq_label_ratio: {:.6f}".format(last_token_eq_label_ratio))
 
                 if args.t_fusion_mode == "gate" and model.last_alpha_stats is not None:
                     logging.info("[DEBUG][T-GATE] alpha_mean: {:.6f}; alpha_var: {:.6f}".format(

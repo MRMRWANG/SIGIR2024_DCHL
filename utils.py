@@ -250,14 +250,18 @@ def normalized_adj(adj, is_symmetric=True):
     """Normalize adjacent matrix for GCN"""
     if is_symmetric:
         rowsum = np.array(adj.sum(1))
-        d_inv = np.power(rowsum + 1e-8, -1/2).flatten()
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            d_inv = np.power(rowsum + 1e-8, -1/2).flatten()
         d_inv[np.isinf(d_inv)] = 0.
+        d_inv[np.isnan(d_inv)] = 0.
         d_mat_inv = sp.diags(d_inv)
         norm_adj = d_mat_inv * adj * d_mat_inv
     else:
         rowsum = np.array(adj.sum(1))
-        d_inv = np.power(rowsum + 1e-8, -1).flatten()
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            d_inv = np.power(rowsum + 1e-8, -1).flatten()
         d_inv[np.isinf(d_inv)] = 0.
+        d_inv[np.isnan(d_inv)] = 0.
         d_mat_inv = sp.diags(d_inv)
         norm_adj = d_mat_inv * adj
 
@@ -398,8 +402,10 @@ def get_hyper_deg(incidence_matrix):
     # inv_hyper_deg_diag = sp.diags(inv_hyper_deg.toarray()[0])
 
     rowsum = np.array(incidence_matrix.sum(1))
-    d_inv = np.power(rowsum, -1).flatten()
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        d_inv = np.power(rowsum, -1).flatten()
     d_inv[np.isinf(d_inv)] = 0.
+    d_inv[np.isnan(d_inv)] = 0.
     d_mat_inv = sp.diags(d_inv)
 
     return d_mat_inv
