@@ -236,7 +236,7 @@ class DCHL(nn.Module):
         self.num_prototypes = 64
         self.prototype_tau = 1.0
         self.tau_assign = 0.1
-        self.proto_graph_quantile = 0.8
+        self.proto_graph_quantile = 0.85
         self.lambda_proto = 0.1
         self.beta_proto = 1.0
         self.proto_tar_learner = nn.Linear(self.emb_dim, self.emb_dim)
@@ -486,4 +486,3 @@ class DCHL(nn.Module):
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
 
         return prediction, loss_cl_user, loss_cl_poi
-
