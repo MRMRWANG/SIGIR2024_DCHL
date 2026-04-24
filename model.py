@@ -235,12 +235,20 @@ class DCHL(nn.Module):
         # perturbing the original DCHL/fine-branch initialization order.
         self.num_prototypes = 64
         self.prototype_tau = 1.0
+        self.tau_assign = 0.1
+        self.proto_graph_quantile = 0.8
         self.lambda_proto = 0.1
+        self.proto_tar_learner = nn.Linear(self.emb_dim, self.emb_dim)
+        self.proto_src_learner = nn.Linear(self.emb_dim, self.emb_dim)
         self.prototype_embeddings = nn.Parameter(torch.empty(self.num_prototypes, self.emb_dim))
 
         # RNG isolation: init BTGR params without changing subsequent/global RNG state.
         cpu_rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        nn.init.xavier_uniform_(self.proto_tar_learner.weight)
+        nn.init.zeros_(self.proto_tar_learner.bias)
+        nn.init.xavier_uniform_(self.proto_src_learner.weight)
+        nn.init.zeros_(self.proto_src_learner.bias)
         nn.init.xavier_uniform_(self.prototype_embeddings)
         torch.set_rng_state(cpu_rng_state)
         if cuda_rng_state is not None:
@@ -333,35 +341,54 @@ class DCHL(nn.Module):
                 }
         else:
             # BTGR-v1 coarse/prototype-level transition branch
-            # Normalize Z and prototypes before assignment for stable cosine-like matching.
-            # Z_norm: [L, d], P_norm: [K, d], logits: [L, K], A_hard: [L, K]
+            # Normalize Z and prototypes before assignment.
+            # Z_norm: [L, d], P_norm: [K, d], logits: [L, K]
             z_norm = F.normalize(seq_gate_pois_embs, p=2, dim=1)
             p_norm = F.normalize(self.prototype_embeddings, p=2, dim=1)
             assign_logits = torch.matmul(z_norm, p_norm.T)
-            assign_idx = torch.argmax(assign_logits, dim=1)  # [L]
-            assignment = F.one_hot(assign_idx, num_classes=self.num_prototypes).to(dtype=seq_gate_pois_embs.dtype)
 
-            # debug: assignment entropy (per POI), prototype mass statistics
+            # Straight-through hard assignment: hard in forward, soft in backward.
+            a_soft = F.softmax(assign_logits / self.tau_assign, dim=1)  # [L, K]
+            assign_idx = torch.argmax(a_soft, dim=1)  # [L]
+            a_hard = F.one_hot(assign_idx, num_classes=self.num_prototypes).to(dtype=seq_gate_pois_embs.dtype)
+            assignment = a_hard - a_soft.detach() + a_soft
+
+            # debug: assignment entropy (soft/hard) and prototype mass statistics
             eps = 1e-12
-            assign_entropy = -(assignment * (assignment + eps).log()).sum(dim=1)  # [L]
+            assign_entropy_soft = -(a_soft * (a_soft + eps).log()).sum(dim=1)  # [L]
+            assign_entropy_hard = -(a_hard * (a_hard + eps).log()).sum(dim=1)  # [L]
             prototype_mass = assignment.sum(dim=0)  # [K]
 
-            # Dual-graph coarse propagation aligned with T branch (tar -> src), no densification on [L, L].
-            trans_to_proto_tar = torch.sparse.mm(dataset.HG_poi_tar, assignment)         # [L, K]
-            trans_to_proto_src = torch.sparse.mm(dataset.HG_poi_src, assignment)         # [L, K]
-            g_proto_tar = torch.matmul(assignment.T, trans_to_proto_tar)                 # [K, K]
-            g_proto_src = torch.matmul(assignment.T, trans_to_proto_src)                 # [K, K]
+            # Z_proto = (A^T @ Z) / mass  -> prototype-quality normalized weighted mean
+            proto_embs_sum = torch.matmul(assignment.T, seq_gate_pois_embs)          # [K, d]
+            proto_embs = proto_embs_sum / (prototype_mass.unsqueeze(1) + 1e-8)       # [K, d]
 
-            # add self-loop and row-normalize each prototype graph
+            # Build learned prototype-level graphs (tar/src) from prototype features:
+            # pairwise cosine similarity + quantile threshold discrete mask.
+            proto_tar_feat = self.proto_tar_learner(proto_embs)                       # [K, d]
+            proto_src_feat = self.proto_src_learner(proto_embs)                       # [K, d]
+            proto_tar_norm = F.normalize(proto_tar_feat, p=2, dim=1)
+            proto_src_norm = F.normalize(proto_src_feat, p=2, dim=1)
+
+            sim_tar = torch.matmul(proto_tar_norm, proto_tar_norm.T)                  # [K, K], [-1, 1]
+            sim_src = torch.matmul(proto_src_norm, proto_src_norm.T)                  # [K, K], [-1, 1]
+            sim_tar_norm = (sim_tar + 1.0) * 0.5                                      # [K, K], [0, 1]
+            sim_src_norm = (sim_src + 1.0) * 0.5                                      # [K, K], [0, 1]
+
+            thr_tar = torch.quantile(sim_tar_norm.reshape(-1), self.proto_graph_quantile)
+            thr_src = torch.quantile(sim_src_norm.reshape(-1), self.proto_graph_quantile)
+            mask_tar = (sim_tar_norm >= thr_tar).to(sim_tar_norm.dtype)
+            mask_src = (sim_src_norm >= thr_src).to(sim_src_norm.dtype)
+            g_proto_tar = sim_tar_norm * mask_tar
+            g_proto_src = sim_src_norm * mask_src
+
+            # add self-loop and row-normalize each learned prototype graph
             eye_k = torch.eye(self.num_prototypes, device=g_proto_tar.device, dtype=g_proto_tar.dtype)
             g_proto_tar = g_proto_tar + eye_k
             g_proto_src = g_proto_src + eye_k
             g_proto_tar = g_proto_tar / (g_proto_tar.sum(dim=1, keepdim=True) + 1e-8)
             g_proto_src = g_proto_src / (g_proto_src.sum(dim=1, keepdim=True) + 1e-8)
 
-            # Z_proto = (A^T @ Z) / mass  -> prototype-quality normalized weighted mean
-            proto_embs_sum = torch.matmul(assignment.T, seq_gate_pois_embs)          # [K, d]
-            proto_embs = proto_embs_sum / (prototype_mass.unsqueeze(1) + 1e-8)       # [K, d]
             # H_proto_mid = G_proto_tar @ Z_proto; H_proto = G_proto_src @ H_proto_mid
             proto_mid = torch.matmul(g_proto_tar, proto_embs)                        # [K, d]
             proto_propag = torch.matmul(g_proto_src, proto_mid)                      # [K, d]
@@ -374,15 +401,18 @@ class DCHL(nn.Module):
             # debug stats for BTGR-v1 (kept as attributes for external inspection)
             with torch.no_grad():
                 self.btgr_debug_stats = {
-                    "assign_entropy_mean": assign_entropy.mean().detach().item(),
+                    "assign_entropy_soft_mean": assign_entropy_soft.mean().detach().item(),
+                    "assign_entropy_hard_mean": assign_entropy_hard.mean().detach().item(),
                     "prototype_mass_mean": prototype_mass.mean().detach().item(),
                     "prototype_mass_std": prototype_mass.std(unbiased=False).detach().item(),
                     "prototype_mass_min": prototype_mass.min().detach().item(),
                     "prototype_mass_max": prototype_mass.max().detach().item(),
                     "G_proto_tar_mean": g_proto_tar.mean().detach().item(),
                     "G_proto_tar_var": g_proto_tar.var(unbiased=False).detach().item(),
+                    "G_proto_tar_sparsity": (g_proto_tar <= 1e-12).float().mean().detach().item(),
                     "G_proto_src_mean": g_proto_src.mean().detach().item(),
                     "G_proto_src_var": g_proto_src.var(unbiased=False).detach().item(),
+                    "G_proto_src_sparsity": (g_proto_src <= 1e-12).float().mean().detach().item(),
                     "H_coarse_norm_mean": trans_pois_embs_coarse.norm(dim=1).mean().detach().item(),
                     "H_fine_norm_mean": trans_pois_embs_fine.norm(dim=1).mean().detach().item(),
                 }
