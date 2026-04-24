@@ -334,11 +334,12 @@ class DCHL(nn.Module):
         else:
             # BTGR-v1 coarse/prototype-level transition branch
             # Normalize Z and prototypes before assignment for stable cosine-like matching.
-            # Z_norm: [L, d], P_norm: [K, d], assign_logits: [L, K], A: [L, K]
+            # Z_norm: [L, d], P_norm: [K, d], logits: [L, K], A_hard: [L, K]
             z_norm = F.normalize(seq_gate_pois_embs, p=2, dim=1)
             p_norm = F.normalize(self.prototype_embeddings, p=2, dim=1)
-            assign_logits = torch.matmul(z_norm, p_norm.T) / self.prototype_tau
-            assignment = F.softmax(assign_logits, dim=1)
+            assign_logits = torch.matmul(z_norm, p_norm.T)
+            assign_idx = torch.argmax(assign_logits, dim=1)  # [L]
+            assignment = F.one_hot(assign_idx, num_classes=self.num_prototypes).to(dtype=seq_gate_pois_embs.dtype)
 
             # debug: assignment entropy (per POI), prototype mass statistics
             eps = 1e-12
