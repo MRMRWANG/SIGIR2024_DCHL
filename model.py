@@ -187,6 +187,10 @@ class DCHL(nn.Module):
 
         # temporal branch edge refinement strength
         self.alpha_t = 0.1
+        # BTGR-v1 prototype branch configs
+        self.num_prototypes = 64
+        self.prototype_tau = 1.0
+        self.lambda_proto = 0.1
 
         # network
         self.mv_hconv_network = MultiViewHyperConvNetwork(args.num_mv_layers, args.emb_dim, 0, device)
@@ -197,6 +201,8 @@ class DCHL(nn.Module):
             args.dropout,
             alpha_t=self.alpha_t,
         )
+        self.prototype_embeddings = nn.Parameter(torch.empty(self.num_prototypes, self.emb_dim))
+        nn.init.xavier_uniform_(self.prototype_embeddings)
 
         # gate for adaptive fusion with pois embeddings
         self.hyper_gate = nn.Sequential(nn.Linear(args.emb_dim, 1), nn.Sigmoid())
@@ -304,7 +310,64 @@ class DCHL(nn.Module):
         geo_batch_users_embs = geo_structural_users_embs[batch["user_idx"]]  # [BS, d]
 
         # poi-poi directed hypergraph
-        trans_pois_embs = self.di_hconv_network(seq_gate_pois_embs, dataset.HG_poi_src, dataset.HG_poi_tar)
+        trans_pois_embs_fine = self.di_hconv_network(seq_gate_pois_embs, dataset.HG_poi_src, dataset.HG_poi_tar)
+
+        # BTGR-v1 coarse/prototype-level transition branch
+        # Normalize Z and prototypes before assignment for stable cosine-like matching.
+        # Z_norm: [L, d], P_norm: [K, d], assign_logits: [L, K], A: [L, K]
+        z_norm = F.normalize(seq_gate_pois_embs, p=2, dim=1)
+        p_norm = F.normalize(self.prototype_embeddings, p=2, dim=1)
+        assign_logits = torch.matmul(z_norm, p_norm.T) / self.prototype_tau
+        assignment = F.softmax(assign_logits, dim=1)
+
+        # debug: assignment entropy (per POI), prototype mass statistics
+        eps = 1e-12
+        assign_entropy = -(assignment * (assignment + eps).log()).sum(dim=1)  # [L]
+        prototype_mass = assignment.sum(dim=0)  # [K]
+
+        # Dual-graph coarse propagation aligned with T branch (tar -> src), no densification on [L, L].
+        trans_to_proto_tar = torch.sparse.mm(dataset.HG_poi_tar, assignment)         # [L, K]
+        trans_to_proto_src = torch.sparse.mm(dataset.HG_poi_src, assignment)         # [L, K]
+        g_proto_tar = torch.matmul(assignment.T, trans_to_proto_tar)                 # [K, K]
+        g_proto_src = torch.matmul(assignment.T, trans_to_proto_src)                 # [K, K]
+
+        # add self-loop and row-normalize each prototype graph
+        eye_k = torch.eye(self.num_prototypes, device=g_proto_tar.device, dtype=g_proto_tar.dtype)
+        g_proto_tar = g_proto_tar + eye_k
+        g_proto_src = g_proto_src + eye_k
+        g_proto_tar = g_proto_tar / (g_proto_tar.sum(dim=1, keepdim=True) + 1e-8)
+        g_proto_src = g_proto_src / (g_proto_src.sum(dim=1, keepdim=True) + 1e-8)
+
+        # Z_proto = (A^T @ Z) / mass  -> prototype-quality normalized weighted mean
+        proto_embs_sum = torch.matmul(assignment.T, seq_gate_pois_embs)          # [K, d]
+        proto_embs = proto_embs_sum / (prototype_mass.unsqueeze(1) + 1e-8)       # [K, d]
+        # H_proto_mid = G_proto_tar @ Z_proto; H_proto = G_proto_src @ H_proto_mid
+        proto_mid = torch.matmul(g_proto_tar, proto_embs)                        # [K, d]
+        proto_propag = torch.matmul(g_proto_src, proto_mid)                      # [K, d]
+        # H_coarse = A @ H_proto
+        trans_pois_embs_coarse = torch.matmul(assignment, proto_propag)          # [L, d]
+
+        # H_T_final = H_fine + lambda_proto * H_coarse
+        trans_pois_embs = trans_pois_embs_fine + self.lambda_proto * trans_pois_embs_coarse
+
+        # debug stats for BTGR-v1 (kept as attributes for external inspection)
+        with torch.no_grad():
+            self.btgr_debug_stats = {
+                "assign_entropy_mean": assign_entropy.mean().detach().item(),
+                "prototype_mass_mean": prototype_mass.mean().detach().item(),
+                "prototype_mass_std": prototype_mass.std(unbiased=False).detach().item(),
+                "prototype_mass_min": prototype_mass.min().detach().item(),
+                "prototype_mass_max": prototype_mass.max().detach().item(),
+                "G_proto_tar_mean": g_proto_tar.mean().detach().item(),
+                "G_proto_tar_var": g_proto_tar.var(unbiased=False).detach().item(),
+                "G_proto_src_mean": g_proto_src.mean().detach().item(),
+                "G_proto_src_var": g_proto_src.var(unbiased=False).detach().item(),
+                "H_coarse_norm_mean": trans_pois_embs_coarse.norm(dim=1).mean().detach().item(),
+                "H_fine_norm_mean": trans_pois_embs_fine.norm(dim=1).mean().detach().item(),
+            }
+            self.btgr_debug_stats["H_coarse_norm_over_H_fine_norm"] = (
+                self.btgr_debug_stats["H_coarse_norm_mean"] / (self.btgr_debug_stats["H_fine_norm_mean"] + 1e-8)
+            )
         # transition-aware user embeddings
         trans_structural_users_embs = torch.sparse.mm(dataset.HG_up, trans_pois_embs)
         trans_batch_users_embs = trans_structural_users_embs[batch["user_idx"]]  # [BS, d]
