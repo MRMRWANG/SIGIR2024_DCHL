@@ -238,6 +238,7 @@ class DCHL(nn.Module):
         self.tau_assign = 0.1
         self.proto_graph_quantile = 0.8
         self.lambda_proto = 0.1
+        self.beta_proto = 1.0
         self.proto_tar_learner = nn.Linear(self.emb_dim, self.emb_dim)
         self.proto_src_learner = nn.Linear(self.emb_dim, self.emb_dim)
         self.prototype_embeddings = nn.Parameter(torch.empty(self.num_prototypes, self.emb_dim))
@@ -389,9 +390,12 @@ class DCHL(nn.Module):
             g_proto_tar = g_proto_tar / (g_proto_tar.sum(dim=1, keepdim=True) + 1e-8)
             g_proto_src = g_proto_src / (g_proto_src.sum(dim=1, keepdim=True) + 1e-8)
 
-            # H_proto_mid = G_proto_tar @ Z_proto; H_proto = G_proto_src @ H_proto_mid
+            # H_proto_mid = G_proto_tar @ Z_proto; H_proto_msg = G_proto_src @ H_proto_mid
             proto_mid = torch.matmul(g_proto_tar, proto_embs)                        # [K, d]
-            proto_propag = torch.matmul(g_proto_src, proto_mid)                      # [K, d]
+            proto_msg = torch.matmul(g_proto_src, proto_mid)                         # [K, d]
+            # Residual coarse propagation: strengthen coarse branch internally
+            # without changing the outer fusion weight lambda_proto.
+            proto_propag = proto_embs + self.beta_proto * proto_msg                  # [K, d]
             # H_coarse = A @ H_proto
             trans_pois_embs_coarse = torch.matmul(assignment, proto_propag)          # [L, d]
 
@@ -413,6 +417,8 @@ class DCHL(nn.Module):
                     "G_proto_src_mean": g_proto_src.mean().detach().item(),
                     "G_proto_src_var": g_proto_src.var(unbiased=False).detach().item(),
                     "G_proto_src_sparsity": (g_proto_src <= 1e-12).float().mean().detach().item(),
+                    "H_proto_msg_norm_mean": proto_msg.norm(dim=1).mean().detach().item(),
+                    "H_proto_norm_mean": proto_propag.norm(dim=1).mean().detach().item(),
                     "H_coarse_norm_mean": trans_pois_embs_coarse.norm(dim=1).mean().detach().item(),
                     "H_fine_norm_mean": trans_pois_embs_fine.norm(dim=1).mean().detach().item(),
                 }
@@ -438,6 +444,8 @@ class DCHL(nn.Module):
                         f"G_proto_tar_var={self.btgr_debug_stats['G_proto_tar_var']:.6f} | "
                         f"G_proto_src_mean={self.btgr_debug_stats['G_proto_src_mean']:.6f} | "
                         f"G_proto_src_var={self.btgr_debug_stats['G_proto_src_var']:.6f} | "
+                        f"H_proto_msg_norm_mean={self.btgr_debug_stats['H_proto_msg_norm_mean']:.6f} | "
+                        f"H_proto_norm_mean={self.btgr_debug_stats['H_proto_norm_mean']:.6f} | "
                         f"H_coarse_norm_mean={self.btgr_debug_stats['H_coarse_norm_mean']:.6f} | "
                         f"H_fine_norm_mean={self.btgr_debug_stats['H_fine_norm_mean']:.6f} | "
                         "H_coarse_norm_over_H_fine_norm="
@@ -478,5 +486,4 @@ class DCHL(nn.Module):
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
 
         return prediction, loss_cl_user, loss_cl_poi
-
 
