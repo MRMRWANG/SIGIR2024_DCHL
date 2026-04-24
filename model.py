@@ -419,6 +419,12 @@ class DCHL(nn.Module):
                 self.btgr_debug_stats["H_coarse_norm_over_H_fine_norm"] = (
                     self.btgr_debug_stats["H_coarse_norm_mean"] / (self.btgr_debug_stats["H_fine_norm_mean"] + 1e-8)
                 )
+                self.btgr_debug_stats["effective_coarse_norm_mean"] = (
+                    self.lambda_proto * self.btgr_debug_stats["H_coarse_norm_mean"]
+                )
+                self.btgr_debug_stats["effective_coarse_over_fine"] = (
+                    self.lambda_proto * self.btgr_debug_stats["H_coarse_norm_over_H_fine_norm"]
+                )
                 if not self.btgr_debug_printed:
                     print(
                         "[BTGR-DEBUG] "
@@ -428,10 +434,18 @@ class DCHL(nn.Module):
                         f"prototype_mass_std={self.btgr_debug_stats['prototype_mass_std']:.6f} | "
                         f"prototype_mass_min={self.btgr_debug_stats['prototype_mass_min']:.6f} | "
                         f"prototype_mass_max={self.btgr_debug_stats['prototype_mass_max']:.6f} | "
+                        f"G_proto_tar_mean={self.btgr_debug_stats['G_proto_tar_mean']:.6f} | "
+                        f"G_proto_tar_var={self.btgr_debug_stats['G_proto_tar_var']:.6f} | "
+                        f"G_proto_src_mean={self.btgr_debug_stats['G_proto_src_mean']:.6f} | "
+                        f"G_proto_src_var={self.btgr_debug_stats['G_proto_src_var']:.6f} | "
                         f"H_coarse_norm_mean={self.btgr_debug_stats['H_coarse_norm_mean']:.6f} | "
                         f"H_fine_norm_mean={self.btgr_debug_stats['H_fine_norm_mean']:.6f} | "
                         "H_coarse_norm_over_H_fine_norm="
-                        f"{self.btgr_debug_stats['H_coarse_norm_over_H_fine_norm']:.6f}"
+                        f"{self.btgr_debug_stats['H_coarse_norm_over_H_fine_norm']:.6f} | "
+                        "effective_coarse_norm_mean="
+                        f"{self.btgr_debug_stats['effective_coarse_norm_mean']:.6f} | "
+                        "effective_coarse_over_fine="
+                        f"{self.btgr_debug_stats['effective_coarse_over_fine']:.6f}"
                     )
                     self.btgr_debug_printed = True
         # transition-aware user embeddings
@@ -464,6 +478,5 @@ class DCHL(nn.Module):
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
 
         return prediction, loss_cl_user, loss_cl_poi
-
 
 
