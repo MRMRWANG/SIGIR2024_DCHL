@@ -422,7 +422,8 @@ class DCHL(nn.Module):
                 if not self.btgr_debug_printed:
                     print(
                         "[BTGR-DEBUG] "
-                        f"assign_entropy_mean={self.btgr_debug_stats['assign_entropy_mean']:.6f} | "
+                        f"assign_entropy_soft_mean={self.btgr_debug_stats['assign_entropy_soft_mean']:.6f} | "
+                        f"assign_entropy_hard_mean={self.btgr_debug_stats['assign_entropy_hard_mean']:.6f} | "
                         f"prototype_mass_mean={self.btgr_debug_stats['prototype_mass_mean']:.6f} | "
                         f"prototype_mass_std={self.btgr_debug_stats['prototype_mass_std']:.6f} | "
                         f"prototype_mass_min={self.btgr_debug_stats['prototype_mass_min']:.6f} | "
