@@ -302,37 +302,13 @@ class DCHL(nn.Module):
 
         # final fusion for user and poi embeddings
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
+        sum_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
         poi_views = torch.stack([norm_hg_pois_embs, norm_geo_pois_embs, norm_trans_pois_embs], dim=1)
-        fusion_pois_embs = self.poi_semantic_attention(poi_views)
-
-        # Temporary shape debug checks for fusion path validation.
-        assert norm_hg_pois_embs.dim() == 2 and norm_hg_pois_embs.size(1) == self.emb_dim, \
-            f"norm_hg_pois_embs shape mismatch: got {tuple(norm_hg_pois_embs.shape)}, expected [L, {self.emb_dim}]"
-        assert norm_geo_pois_embs.dim() == 2 and norm_geo_pois_embs.size(1) == self.emb_dim, \
-            f"norm_geo_pois_embs shape mismatch: got {tuple(norm_geo_pois_embs.shape)}, expected [L, {self.emb_dim}]"
-        assert norm_trans_pois_embs.dim() == 2 and norm_trans_pois_embs.size(1) == self.emb_dim, \
-            f"norm_trans_pois_embs shape mismatch: got {tuple(norm_trans_pois_embs.shape)}, expected [L, {self.emb_dim}]"
-        assert poi_views.shape == (self.num_pois, 3, self.emb_dim), \
-            f"poi_views shape mismatch: got {tuple(poi_views.shape)}, expected ({self.num_pois}, 3, {self.emb_dim})"
-        assert fusion_pois_embs.shape == (self.num_pois, self.emb_dim), \
-            f"fusion_pois_embs shape mismatch: got {tuple(fusion_pois_embs.shape)}, expected ({self.num_pois}, {self.emb_dim})"
-        assert fusion_batch_users_embs.dim() == 2 and fusion_batch_users_embs.size(1) == self.emb_dim, \
-            f"fusion_batch_users_embs shape mismatch: got {tuple(fusion_batch_users_embs.shape)}, expected [BS, {self.emb_dim}]"
+        attn_pois_embs = self.poi_semantic_attention(poi_views)
+        fusion_pois_embs = sum_pois_embs + 0.1 * attn_pois_embs
 
         # prediction
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
-        assert prediction.shape == (fusion_batch_users_embs.size(0), self.num_pois), \
-            f"prediction shape mismatch: got {tuple(prediction.shape)}, expected ({fusion_batch_users_embs.size(0)}, {self.num_pois})"
-        print(
-            "[SHAPE-DEBUG] "
-            f"norm_hg_pois_embs={tuple(norm_hg_pois_embs.shape)} | "
-            f"norm_geo_pois_embs={tuple(norm_geo_pois_embs.shape)} | "
-            f"norm_trans_pois_embs={tuple(norm_trans_pois_embs.shape)} | "
-            f"poi_views={tuple(poi_views.shape)} | "
-            f"fusion_pois_embs={tuple(fusion_pois_embs.shape)} | "
-            f"fusion_batch_users_embs={tuple(fusion_batch_users_embs.shape)} | "
-            f"prediction={tuple(prediction.shape)}"
-        )
 
         return prediction, loss_cl_user, loss_cl_poi
 
