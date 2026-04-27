@@ -32,27 +32,30 @@ class SemanticAttention(nn.Module):
         return out
 
 
-class SemanticGuidedViewCalibrationFusion(nn.Module):
+class NonCompetitiveSemanticViewCalibration(nn.Module):
     """
-    Semantic-guided view calibration fusion for multi-view POI embeddings.
+    Non-competitive semantic view calibration for multi-view POI embeddings.
     Input:  [N, V, D]
     Output: [N, D]
     """
 
-    def __init__(self, in_size, hidden_size=128, num_views=3):
-        super(SemanticGuidedViewCalibrationFusion, self).__init__()
-        self.num_views = num_views
+    def __init__(self, in_size, hidden_size=128, rho=0.1):
+        super(NonCompetitiveSemanticViewCalibration, self).__init__()
+        self.rho = rho
         self.project = nn.Sequential(
             nn.Linear(in_size, hidden_size),
             nn.Tanh(),
-            nn.Linear(hidden_size, 1, bias=False)
+            nn.Linear(hidden_size, 1, bias=True)
         )
-        self.alpha = nn.Parameter(torch.zeros(1))
+
+        # Zero-init the last layer so the module is exactly equivalent to
+        # the original DCHL POI sum fusion at initialization.
+        nn.init.zeros_(self.project[2].weight)
+        nn.init.zeros_(self.project[2].bias)
 
     def forward(self, z):
-        score = self.project(z)  # [N, V, 1]
-        beta = torch.softmax(score, dim=1)  # [N, V, 1]
-        calib = 1.0 + self.alpha * (beta - 1.0 / self.num_views)
+        delta = self.rho * torch.tanh(self.project(z))  # [N, V, 1]
+        calib = 1.0 + delta
         out = torch.sum(calib * z, dim=1)  # [N, D]
 
         return out
@@ -231,7 +234,7 @@ class DCHL(nn.Module):
 
         # Initialize new fusion module at the end to avoid perturbing
         # the original DCHL parameter initialization order.
-        self.poi_view_calibration_fusion = SemanticGuidedViewCalibrationFusion(args.emb_dim)
+        self.poi_view_calibration_fusion = NonCompetitiveSemanticViewCalibration(args.emb_dim)
 
     @staticmethod
     def row_shuffle(embedding):
