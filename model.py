@@ -305,7 +305,7 @@ class DCHL(nn.Module):
         sum_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
         poi_views = torch.stack([norm_hg_pois_embs, norm_geo_pois_embs, norm_trans_pois_embs], dim=1)
         attn_pois_embs = self.poi_semantic_attention(poi_views)
-        fusion_pois_embs = sum_pois_embs + 0.1 * attn_pois_embs
+        fusion_pois_embs = sum_pois_embs + 0.05 * attn_pois_embs
 
         # prediction
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
