@@ -261,6 +261,10 @@ def main():
     logging.info("6. Final Results")
     formatted_dict = {key: f"{value:.4f}" for key, value in final_results.items()}
     logging.info(formatted_dict)
+    calibration_module = getattr(model, "poi_view_calibration_fusion", None)
+    alpha_param = getattr(calibration_module, "alpha", None)
+    if alpha_param is not None:
+        logging.info("[CALIBRATION] alpha = {:.6f}".format(alpha_param.detach().item()))
     logging.info("\n")
 
 
