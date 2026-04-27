@@ -32,6 +32,32 @@ class SemanticAttention(nn.Module):
         return out
 
 
+class SemanticGuidedViewCalibrationFusion(nn.Module):
+    """
+    Semantic-guided view calibration fusion for multi-view POI embeddings.
+    Input:  [N, V, D]
+    Output: [N, D]
+    """
+
+    def __init__(self, in_size, hidden_size=128, num_views=3):
+        super(SemanticGuidedViewCalibrationFusion, self).__init__()
+        self.num_views = num_views
+        self.project = nn.Sequential(
+            nn.Linear(in_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1, bias=False)
+        )
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, z):
+        score = self.project(z)  # [N, V, 1]
+        beta = torch.softmax(score, dim=1)  # [N, V, 1]
+        calib = 1.0 + self.alpha * (beta - 1.0 / self.num_views)
+        out = torch.sum(calib * z, dim=1)  # [N, D]
+
+        return out
+
+
 class MultiViewHyperConvLayer(nn.Module):
     """
     Multi-view Hypergraph Convolutional Layer
@@ -203,9 +229,9 @@ class DCHL(nn.Module):
         # dropout
         self.dropout = nn.Dropout(args.dropout)
 
-        # Initialize new attention module at the end to avoid perturbing
+        # Initialize new fusion module at the end to avoid perturbing
         # the original DCHL parameter initialization order.
-        self.poi_semantic_attention = SemanticAttention(args.emb_dim)
+        self.poi_view_calibration_fusion = SemanticGuidedViewCalibrationFusion(args.emb_dim)
 
     @staticmethod
     def row_shuffle(embedding):
@@ -305,10 +331,8 @@ class DCHL(nn.Module):
 
         # final fusion for user and poi embeddings
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
-        sum_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
         poi_views = torch.stack([norm_hg_pois_embs, norm_geo_pois_embs, norm_trans_pois_embs], dim=1)
-        attn_pois_embs = self.poi_semantic_attention(poi_views)
-        fusion_pois_embs = sum_pois_embs + 0.05 * attn_pois_embs
+        fusion_pois_embs = self.poi_view_calibration_fusion(poi_views)
 
         # prediction
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
