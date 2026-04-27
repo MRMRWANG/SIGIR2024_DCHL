@@ -9,6 +9,29 @@ import torch
 import torch.nn.functional as F
 
 
+class SemanticAttention(nn.Module):
+    """
+    Sample-wise semantic attention for multi-view fusion.
+    Input:  [N, V, D]
+    Output: [N, D]
+    """
+
+    def __init__(self, in_size, hidden_size=128):
+        super(SemanticAttention, self).__init__()
+        self.project = nn.Sequential(
+            nn.Linear(in_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1, bias=False)
+        )
+
+    def forward(self, z):
+        score = self.project(z)            # [N, V, 1]
+        beta = torch.softmax(score, dim=1) # [N, V, 1]
+        out = torch.sum(beta * z, dim=1)   # [N, D]
+
+        return out
+
+
 class MultiViewHyperConvLayer(nn.Module):
     """
     Multi-view Hypergraph Convolutional Layer
@@ -155,6 +178,7 @@ class DCHL(nn.Module):
         # gate for adaptive fusion with users embeddings
         self.user_hyper_gate = nn.Sequential(nn.Linear(args.emb_dim, 1), nn.Sigmoid())
         self.user_gcn_gate = nn.Sequential(nn.Linear(args.emb_dim, 1), nn.Sigmoid())
+        self.poi_semantic_attention = SemanticAttention(args.emb_dim)
 
         # temporal-augmentation
         self.pos_embeddings = nn.Embedding(1500, self.emb_dim, padding_idx=0)
@@ -278,10 +302,37 @@ class DCHL(nn.Module):
 
         # final fusion for user and poi embeddings
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
-        fusion_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
+        poi_views = torch.stack([norm_hg_pois_embs, norm_geo_pois_embs, norm_trans_pois_embs], dim=1)
+        fusion_pois_embs = self.poi_semantic_attention(poi_views)
+
+        # Temporary shape debug checks for fusion path validation.
+        assert norm_hg_pois_embs.dim() == 2 and norm_hg_pois_embs.size(1) == self.emb_dim, \
+            f"norm_hg_pois_embs shape mismatch: got {tuple(norm_hg_pois_embs.shape)}, expected [L, {self.emb_dim}]"
+        assert norm_geo_pois_embs.dim() == 2 and norm_geo_pois_embs.size(1) == self.emb_dim, \
+            f"norm_geo_pois_embs shape mismatch: got {tuple(norm_geo_pois_embs.shape)}, expected [L, {self.emb_dim}]"
+        assert norm_trans_pois_embs.dim() == 2 and norm_trans_pois_embs.size(1) == self.emb_dim, \
+            f"norm_trans_pois_embs shape mismatch: got {tuple(norm_trans_pois_embs.shape)}, expected [L, {self.emb_dim}]"
+        assert poi_views.shape == (self.num_pois, 3, self.emb_dim), \
+            f"poi_views shape mismatch: got {tuple(poi_views.shape)}, expected ({self.num_pois}, 3, {self.emb_dim})"
+        assert fusion_pois_embs.shape == (self.num_pois, self.emb_dim), \
+            f"fusion_pois_embs shape mismatch: got {tuple(fusion_pois_embs.shape)}, expected ({self.num_pois}, {self.emb_dim})"
+        assert fusion_batch_users_embs.dim() == 2 and fusion_batch_users_embs.size(1) == self.emb_dim, \
+            f"fusion_batch_users_embs shape mismatch: got {tuple(fusion_batch_users_embs.shape)}, expected [BS, {self.emb_dim}]"
 
         # prediction
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
+        assert prediction.shape == (fusion_batch_users_embs.size(0), self.num_pois), \
+            f"prediction shape mismatch: got {tuple(prediction.shape)}, expected ({fusion_batch_users_embs.size(0)}, {self.num_pois})"
+        print(
+            "[SHAPE-DEBUG] "
+            f"norm_hg_pois_embs={tuple(norm_hg_pois_embs.shape)} | "
+            f"norm_geo_pois_embs={tuple(norm_geo_pois_embs.shape)} | "
+            f"norm_trans_pois_embs={tuple(norm_trans_pois_embs.shape)} | "
+            f"poi_views={tuple(poi_views.shape)} | "
+            f"fusion_pois_embs={tuple(fusion_pois_embs.shape)} | "
+            f"fusion_batch_users_embs={tuple(fusion_batch_users_embs.shape)} | "
+            f"prediction={tuple(prediction.shape)}"
+        )
 
         return prediction, loss_cl_user, loss_cl_poi
 
