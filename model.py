@@ -203,6 +203,10 @@ class DCHL(nn.Module):
         # dropout
         self.dropout = nn.Dropout(args.dropout)
 
+        # Initialize new attention module at the end to avoid perturbing
+        # the original DCHL parameter initialization order.
+        self.poi_semantic_attention = SemanticAttention(args.emb_dim)
+
     @staticmethod
     def row_shuffle(embedding):
         corrupted_embedding = embedding[torch.randperm(embedding.size()[0])]
@@ -301,7 +305,10 @@ class DCHL(nn.Module):
 
         # final fusion for user and poi embeddings
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
-        fusion_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
+        sum_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
+        poi_views = torch.stack([norm_hg_pois_embs, norm_geo_pois_embs, norm_trans_pois_embs], dim=1)
+        attn_pois_embs = self.poi_semantic_attention(poi_views)
+        fusion_pois_embs = sum_pois_embs + 0.05 * attn_pois_embs
 
         # prediction
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
