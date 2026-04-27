@@ -178,7 +178,6 @@ class DCHL(nn.Module):
         # gate for adaptive fusion with users embeddings
         self.user_hyper_gate = nn.Sequential(nn.Linear(args.emb_dim, 1), nn.Sigmoid())
         self.user_gcn_gate = nn.Sequential(nn.Linear(args.emb_dim, 1), nn.Sigmoid())
-        self.poi_semantic_attention = SemanticAttention(args.emb_dim)
 
         # temporal-augmentation
         self.pos_embeddings = nn.Embedding(1500, self.emb_dim, padding_idx=0)
@@ -302,10 +301,7 @@ class DCHL(nn.Module):
 
         # final fusion for user and poi embeddings
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
-        sum_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
-        poi_views = torch.stack([norm_hg_pois_embs, norm_geo_pois_embs, norm_trans_pois_embs], dim=1)
-        attn_pois_embs = self.poi_semantic_attention(poi_views)
-        fusion_pois_embs = sum_pois_embs + 0.0 * attn_pois_embs
+        fusion_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
 
         # prediction
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
