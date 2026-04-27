@@ -134,7 +134,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.decay)
     criterion = nn.CrossEntropyLoss().to(device)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 'min', verbose=True, factor=args.lr_scheduler_factor)
+        optimizer, 'min',  factor=args.lr_scheduler_factor)
 
     # Train
     logging.info("5. Start Training")
