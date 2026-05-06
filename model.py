@@ -9,6 +9,28 @@ import torch
 import torch.nn.functional as F
 
 
+class ReliabilityAwarePOIViewCalibration(nn.Module):
+    def __init__(self, emb_dim, num_views=3):
+        super(ReliabilityAwarePOIViewCalibration, self).__init__()
+
+        self.num_views = num_views
+        self.reliability_mlp = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.ReLU(),
+            nn.Linear(emb_dim, 1)
+        )
+        self.eta = nn.Parameter(torch.zeros(1))
+
+    def forward(self, poi_views):
+        # poi_views: [num_pois, num_views, emb_dim]
+        reliability_score = self.reliability_mlp(poi_views)  # [num_pois, num_views, 1]
+        reliability_weight = torch.softmax(reliability_score, dim=1)
+        calib = 1 + self.eta * (self.num_views * reliability_weight - 1)
+        fusion_pois_embs = torch.sum(calib * poi_views, dim=1)
+
+        return fusion_pois_embs
+
+
 class MultiViewHyperConvLayer(nn.Module):
     """
     Multi-view Hypergraph Convolutional Layer
@@ -180,6 +202,9 @@ class DCHL(nn.Module):
         # dropout
         self.dropout = nn.Dropout(args.dropout)
 
+        # reliability-aware calibration for poi multi-view fusion
+        self.poi_view_calibration = ReliabilityAwarePOIViewCalibration(args.emb_dim)
+
     @staticmethod
     def row_shuffle(embedding):
         corrupted_embedding = embedding[torch.randperm(embedding.size()[0])]
@@ -278,7 +303,8 @@ class DCHL(nn.Module):
 
         # final fusion for user and poi embeddings
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
-        fusion_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
+        poi_views = torch.stack([norm_hg_pois_embs, norm_geo_pois_embs, norm_trans_pois_embs], dim=1)
+        fusion_pois_embs = self.poi_view_calibration(poi_views)
 
         # prediction
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
