@@ -61,6 +61,40 @@ class NonCompetitiveSemanticViewCalibration(nn.Module):
         return out
 
 
+class UserSemanticGateFusion(nn.Module):
+    """
+    User-side semantic gate fusion for multi-view user embeddings.
+    Input:
+        hg_users_embs    [B, D]
+        geo_users_embs   [B, D]
+        trans_users_embs [B, D]
+    Output:
+        fused_users_embs [B, D]
+    """
+
+    def __init__(self, emb_dim, hidden_size=128):
+        super(UserSemanticGateFusion, self).__init__()
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(3 * emb_dim, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 3)
+        )
+
+    def forward(self, hg_users_embs, geo_users_embs, trans_users_embs):
+        user_concat = torch.cat(
+            [hg_users_embs, geo_users_embs, trans_users_embs],
+            dim=1
+        )  # [B, 3D]
+        gate = torch.sigmoid(self.gate_mlp(user_concat))  # [B, 3]
+        fused_users_embs = (
+            gate[:, 0:1] * hg_users_embs
+            + gate[:, 1:2] * geo_users_embs
+            + gate[:, 2:3] * trans_users_embs
+        )
+
+        return fused_users_embs
+
+
 class MultiViewHyperConvLayer(nn.Module):
     """
     Multi-view Hypergraph Convolutional Layer
@@ -235,6 +269,7 @@ class DCHL(nn.Module):
         # Initialize new fusion module at the end to avoid perturbing
         # the original DCHL parameter initialization order.
         self.poi_view_calibration_fusion = NonCompetitiveSemanticViewCalibration(args.emb_dim)
+        self.user_view_gate_fusion = UserSemanticGateFusion(args.emb_dim)
 
     @staticmethod
     def row_shuffle(embedding):
@@ -327,13 +362,17 @@ class DCHL(nn.Module):
         norm_geo_batch_users_embs = F.normalize(geo_batch_users_embs, p=2, dim=1)
         norm_trans_batch_users_embs = F.normalize(trans_batch_users_embs, p=2, dim=1)
 
-        # adaptive fusion for user embeddings
+        # original independent gates are kept for future ablation
         hyper_coef = self.hyper_gate(norm_hg_batch_users_embs)
         geo_coef = self.gcn_gate(norm_geo_batch_users_embs)
         trans_coef = self.trans_gate(norm_trans_batch_users_embs)
 
         # final fusion for user and poi embeddings
-        fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
+        fusion_batch_users_embs = self.user_view_gate_fusion(
+            norm_hg_batch_users_embs,
+            norm_geo_batch_users_embs,
+            norm_trans_batch_users_embs
+        )
         poi_views = torch.stack([norm_hg_pois_embs, norm_geo_pois_embs, norm_trans_pois_embs], dim=1)
         fusion_pois_embs = self.poi_view_calibration_fusion(poi_views)
 
