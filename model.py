@@ -9,6 +9,32 @@ import torch
 import torch.nn.functional as F
 
 
+class RSEAMultiViewRepresentationRefinement(nn.Module):
+    def __init__(self, emb_dim, num_views=3, evidence_dim=None):
+        super(RSEAMultiViewRepresentationRefinement, self).__init__()
+
+        self.num_views = num_views
+        self.evidence_dim = evidence_dim if evidence_dim is not None else emb_dim
+        self.evidence_head = nn.Linear(emb_dim, self.evidence_dim)
+        self.raw_eta = nn.Parameter(torch.zeros(1))
+        self.W_view = nn.Parameter(torch.eye(num_views))
+
+    def forward(self, poi_views):
+        # poi_views: [num_pois, num_views, emb_dim]
+        evidence = F.softplus(self.evidence_head(poi_views))   # [L, V, K]
+        alpha = evidence + 1.0
+        S = alpha.sum(dim=-1, keepdim=True)
+        belief = evidence / (S + 1e-8)
+        uncertainty = float(self.evidence_dim) / (S + 1e-8)
+        reliability = 1.0 - uncertainty
+
+        eta = 0.1 * torch.tanh(self.raw_eta)
+        modulated_views = poi_views * (1.0 + eta * reliability)
+        refined_views = torch.einsum('vw,nwd->nvd', self.W_view, modulated_views)
+
+        return refined_views
+
+
 class MultiViewHyperConvLayer(nn.Module):
     """
     Multi-view Hypergraph Convolutional Layer
@@ -180,6 +206,9 @@ class DCHL(nn.Module):
         # dropout
         self.dropout = nn.Dropout(args.dropout)
 
+        # RSEA-inspired multi-view representation refinement for POI views
+        self.poi_view_refinement = RSEAMultiViewRepresentationRefinement(args.emb_dim)
+
     @staticmethod
     def row_shuffle(embedding):
         corrupted_embedding = embedding[torch.randperm(embedding.size()[0])]
@@ -227,6 +256,13 @@ class DCHL(nn.Module):
 
         return loss_cl_users
 
+    @staticmethod
+    def normalize_with_scale(embs):
+        scale = embs.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+        norm_embs = embs / scale
+
+        return norm_embs, scale
+
     def forward(self, dataset, batch):
 
         # self-gating input
@@ -242,31 +278,45 @@ class DCHL(nn.Module):
 
         # multi-view hypergraph convolutional network
         hg_pois_embs = self.mv_hconv_network(col_gate_pois_embs, dataset.pad_all_train_sessions, dataset.HG_up, dataset.HG_pu)
-        # hypergraph structure aware users embeddings
-        hg_structural_users_embs = torch.sparse.mm(dataset.HG_up, hg_pois_embs)  # [U, d]
-        hg_batch_users_embs = hg_structural_users_embs[batch["user_idx"]]  # [BS, d]
 
         # poi-poi geographical graph convolutional network
         geo_pois_embs = self.geo_conv_network(geo_gate_pois_embs, dataset.poi_geo_graph)  # [L, d]
-        # geo-aware user embeddings
-        geo_structural_users_embs = torch.sparse.mm(dataset.HG_up, geo_pois_embs)
-        geo_batch_users_embs = geo_structural_users_embs[batch["user_idx"]]  # [BS, d]
 
         # poi-poi directed hypergraph
         trans_pois_embs = self.di_hconv_network(seq_gate_pois_embs, dataset.HG_poi_src, dataset.HG_poi_tar)
+        # normalize poi views before RSEA-inspired refinement
+        norm_hg_pois_embs, hg_scale = self.normalize_with_scale(hg_pois_embs)
+        norm_geo_pois_embs, geo_scale = self.normalize_with_scale(geo_pois_embs)
+        norm_trans_pois_embs, trans_scale = self.normalize_with_scale(trans_pois_embs)
+
+        poi_views = torch.stack([norm_hg_pois_embs, norm_geo_pois_embs, norm_trans_pois_embs], dim=1)
+        refined_poi_views = self.poi_view_refinement(poi_views)
+
+        refined_norm_hg_pois_embs = refined_poi_views[:, 0, :]
+        refined_norm_geo_pois_embs = refined_poi_views[:, 1, :]
+        refined_norm_trans_pois_embs = refined_poi_views[:, 2, :]
+
+        # restore original view scales so the user aggregation path is initially identical to DCHL
+        refined_hg_pois_embs = refined_norm_hg_pois_embs * hg_scale
+        refined_geo_pois_embs = refined_norm_geo_pois_embs * geo_scale
+        refined_trans_pois_embs = refined_norm_trans_pois_embs * trans_scale
+
+        # refined poi views -> user views
+        hg_structural_users_embs = torch.sparse.mm(dataset.HG_up, refined_hg_pois_embs)  # [U, d]
+        hg_batch_users_embs = hg_structural_users_embs[batch["user_idx"]]  # [BS, d]
+
+        geo_structural_users_embs = torch.sparse.mm(dataset.HG_up, refined_geo_pois_embs)
+        geo_batch_users_embs = geo_structural_users_embs[batch["user_idx"]]  # [BS, d]
+
         # transition-aware user embeddings
-        trans_structural_users_embs = torch.sparse.mm(dataset.HG_up, trans_pois_embs)
+        trans_structural_users_embs = torch.sparse.mm(dataset.HG_up, refined_trans_pois_embs)
         trans_batch_users_embs = trans_structural_users_embs[batch["user_idx"]]  # [BS, d]
 
         # cross view contrastive learning
-        loss_cl_poi = self.cal_loss_cl_pois(hg_pois_embs, geo_pois_embs, trans_pois_embs)
+        loss_cl_poi = self.cal_loss_cl_pois(refined_norm_hg_pois_embs, refined_norm_geo_pois_embs, refined_norm_trans_pois_embs)
         loss_cl_user = self.cal_loss_cl_users(hg_batch_users_embs, geo_batch_users_embs, trans_batch_users_embs)
 
         # normalization
-        norm_hg_pois_embs = F.normalize(hg_pois_embs, p=2, dim=1)
-        norm_geo_pois_embs = F.normalize(geo_pois_embs, p=2, dim=1)
-        norm_trans_pois_embs = F.normalize(trans_pois_embs, p=2, dim=1)
-
         norm_hg_batch_users_embs = F.normalize(hg_batch_users_embs, p=2, dim=1)
         norm_geo_batch_users_embs = F.normalize(geo_batch_users_embs, p=2, dim=1)
         norm_trans_batch_users_embs = F.normalize(trans_batch_users_embs, p=2, dim=1)
@@ -278,7 +328,7 @@ class DCHL(nn.Module):
 
         # final fusion for user and poi embeddings
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
-        fusion_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
+        fusion_pois_embs = refined_norm_hg_pois_embs + refined_norm_geo_pois_embs + refined_norm_trans_pois_embs
 
         # prediction
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
