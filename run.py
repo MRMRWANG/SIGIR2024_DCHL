@@ -261,6 +261,14 @@ def main():
     logging.info("6. Final Results")
     formatted_dict = {key: f"{value:.4f}" for key, value in final_results.items()}
     logging.info(formatted_dict)
+    eta_param = None
+    for module_name in ("poi_view_calibration", "poi_view_calibration_fusion"):
+        calibration_module = getattr(model, module_name, None)
+        eta_param = getattr(calibration_module, "eta", None)
+        if eta_param is not None:
+            break
+    if eta_param is not None:
+        logging.info("[RELIABILITY] eta = {:.6f}".format(eta_param.detach().item()))
     logging.info("\n")
 
 
