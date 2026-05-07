@@ -7,25 +7,21 @@
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 
-class ReliabilityAwarePOIViewCalibration(nn.Module):
-    def __init__(self, emb_dim, num_views=3):
-        super(ReliabilityAwarePOIViewCalibration, self).__init__()
+class StructuralReliabilityPOIViewCalibration(nn.Module):
+    def __init__(self, num_views=3):
+        super(StructuralReliabilityPOIViewCalibration, self).__init__()
 
         self.num_views = num_views
-        self.reliability_mlp = nn.Sequential(
-            nn.Linear(emb_dim, emb_dim),
-            nn.ReLU(),
-            nn.Linear(emb_dim, 1)
-        )
         self.eta = nn.Parameter(torch.zeros(1))
 
-    def forward(self, poi_views):
+    def forward(self, poi_views, reliability_score):
         # poi_views: [num_pois, num_views, emb_dim]
-        reliability_score = self.reliability_mlp(poi_views)  # [num_pois, num_views, 1]
-        reliability_weight = torch.softmax(reliability_score, dim=1)
-        calib = 1 + self.eta * (self.num_views * reliability_weight - 1)
+        # reliability_score: [num_pois, num_views, 1]
+        eta_eff = 0.1 * torch.tanh(self.eta)
+        calib = 1 + eta_eff * torch.tanh(reliability_score)
         fusion_pois_embs = torch.sum(calib * poi_views, dim=1)
 
         return fusion_pois_embs
@@ -202,8 +198,8 @@ class DCHL(nn.Module):
         # dropout
         self.dropout = nn.Dropout(args.dropout)
 
-        # reliability-aware calibration for poi multi-view fusion
-        self.poi_view_calibration = ReliabilityAwarePOIViewCalibration(args.emb_dim)
+        # non-competitive structural reliability calibration for poi multi-view fusion
+        self.poi_view_calibration = StructuralReliabilityPOIViewCalibration()
 
     @staticmethod
     def row_shuffle(embedding):
@@ -251,6 +247,25 @@ class DCHL(nn.Module):
         loss_cl_users += self.cal_loss_infonce(norm_geo_batch_users_embs, norm_trans_batch_users_embs)
 
         return loss_cl_users
+
+    def get_structural_reliability_score(self, dataset, device, dtype):
+        collab_degree = np.asarray(dataset.H_pu.sum(axis=1)).reshape(-1)
+        geo_degree = np.asarray(dataset.poi_geo_adj.sum(axis=1)).reshape(-1) - 1.0
+        trans_out_degree = np.asarray(dataset.H_poi_src.sum(axis=1)).reshape(-1)
+        trans_in_degree = np.asarray(dataset.H_poi_tar.sum(axis=1)).reshape(-1)
+        trans_degree = trans_out_degree + trans_in_degree
+
+        d_c = torch.from_numpy(np.log1p(collab_degree)).to(device=device, dtype=dtype)
+        d_g = torch.from_numpy(np.log1p(np.clip(geo_degree, a_min=0.0, a_max=None))).to(device=device, dtype=dtype)
+        d_t = torch.from_numpy(np.log1p(trans_degree)).to(device=device, dtype=dtype)
+
+        d_c = (d_c - d_c.mean()) / (d_c.std(unbiased=False) + 1e-8)
+        d_g = (d_g - d_g.mean()) / (d_g.std(unbiased=False) + 1e-8)
+        d_t = (d_t - d_t.mean()) / (d_t.std(unbiased=False) + 1e-8)
+
+        reliability_score = torch.stack([d_c, d_g, d_t], dim=1).unsqueeze(-1)
+
+        return reliability_score
 
     def forward(self, dataset, batch):
 
@@ -304,7 +319,8 @@ class DCHL(nn.Module):
         # final fusion for user and poi embeddings
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
         poi_views = torch.stack([norm_hg_pois_embs, norm_geo_pois_embs, norm_trans_pois_embs], dim=1)
-        fusion_pois_embs = self.poi_view_calibration(poi_views)
+        reliability_score = self.get_structural_reliability_score(dataset, poi_views.device, poi_views.dtype)
+        fusion_pois_embs = self.poi_view_calibration(poi_views, reliability_score)
 
         # prediction
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
