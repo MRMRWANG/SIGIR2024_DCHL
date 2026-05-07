@@ -9,6 +9,38 @@ import torch
 import torch.nn.functional as F
 
 
+class RSEAViewAggregator(nn.Module):
+    def __init__(self, emb_dim, num_views=3, evidence_dim=None):
+        super(RSEAViewAggregator, self).__init__()
+
+        self.num_views = num_views
+        self.evidence_dim = evidence_dim if evidence_dim is not None else emb_dim
+        self.evidence_head = nn.Linear(emb_dim, self.evidence_dim)
+        self.raw_eta = nn.Parameter(torch.zeros(1))
+        self.register_buffer("I_view", torch.eye(num_views))
+        self.W_delta = nn.Parameter(torch.zeros(num_views, num_views))
+
+    def forward(self, view_embeddings, return_reliability=False):
+        # view_embeddings: [N, V, D]
+        evidence = F.softplus(self.evidence_head(view_embeddings))   # [N, V, K]
+        alpha = evidence + 1.0
+        S = alpha.sum(dim=-1, keepdim=True)
+        uncertainty = float(self.evidence_dim) / (S + 1e-8)
+        reliability = 1.0 - uncertainty
+
+        eta = 0.1 * torch.tanh(self.raw_eta)
+        modulated_views = view_embeddings * (1.0 + eta * reliability)
+
+        W_view = self.I_view + 0.1 * torch.tanh(self.W_delta)
+        mixed_views = torch.einsum('vw,nwd->nvd', W_view, modulated_views)
+        fused_embeddings = mixed_views.sum(dim=1)
+
+        if return_reliability:
+            return fused_embeddings, reliability
+
+        return fused_embeddings
+
+
 class MultiViewHyperConvLayer(nn.Module):
     """
     Multi-view Hypergraph Convolutional Layer
@@ -180,21 +212,32 @@ class DCHL(nn.Module):
         # dropout
         self.dropout = nn.Dropout(args.dropout)
 
+        # dual-side RSEA-inspired reliable view fusion
+        self.user_rsea_aggregator = RSEAViewAggregator(args.emb_dim)
+        self.poi_rsea_aggregator = RSEAViewAggregator(args.emb_dim)
+        self.raw_alpha_user = nn.Parameter(torch.zeros(1))
+        self.raw_alpha_poi = nn.Parameter(torch.zeros(1))
+
     @staticmethod
     def row_shuffle(embedding):
         corrupted_embedding = embedding[torch.randperm(embedding.size()[0])]
 
         return corrupted_embedding
 
-    def cal_loss_infonce(self, emb1, emb2):
+    def cal_loss_infonce(self, emb1, emb2, sample_weight=None):
         pos_score = torch.exp(torch.sum(emb1 * emb2, dim=1) / self.ssl_temp)
         neg_score = torch.sum(torch.exp(torch.mm(emb1, emb2.T) / self.ssl_temp), axis=1)
-        loss = torch.sum(-torch.log(pos_score / (neg_score + 1e-8) + 1e-8))
-        loss /= pos_score.shape[0]
+        loss = -torch.log(pos_score / (neg_score + 1e-8) + 1e-8)
+
+        if sample_weight is None:
+            return loss.mean()
+
+        weight = sample_weight.reshape(-1).to(device=loss.device, dtype=loss.dtype)
+        loss = torch.sum(weight * loss) / (torch.sum(weight) + 1e-8)
 
         return loss
 
-    def cal_loss_cl_pois(self, hg_pois_embs, geo_pois_embs, trans_pois_embs):
+    def cal_loss_cl_pois(self, hg_pois_embs, geo_pois_embs, trans_pois_embs, pair_weights=None):
         # projection
         # proj_hg_pois_embs = self.proj_hg(hg_pois_embs)
         # proj_geo_pois_embs = self.proj_geo(geo_pois_embs)
@@ -207,9 +250,14 @@ class DCHL(nn.Module):
 
         # calculate loss
         loss_cl_pois = 0.0
-        loss_cl_pois += self.cal_loss_infonce(norm_hg_pois_embs, norm_geo_pois_embs)
-        loss_cl_pois += self.cal_loss_infonce(norm_hg_pois_embs, norm_trans_pois_embs)
-        loss_cl_pois += self.cal_loss_infonce(norm_geo_pois_embs, norm_trans_pois_embs)
+        if pair_weights is None:
+            loss_cl_pois += self.cal_loss_infonce(norm_hg_pois_embs, norm_geo_pois_embs)
+            loss_cl_pois += self.cal_loss_infonce(norm_hg_pois_embs, norm_trans_pois_embs)
+            loss_cl_pois += self.cal_loss_infonce(norm_geo_pois_embs, norm_trans_pois_embs)
+        else:
+            loss_cl_pois += self.cal_loss_infonce(norm_hg_pois_embs, norm_geo_pois_embs, pair_weights["hg_geo"])
+            loss_cl_pois += self.cal_loss_infonce(norm_hg_pois_embs, norm_trans_pois_embs, pair_weights["hg_trans"])
+            loss_cl_pois += self.cal_loss_infonce(norm_geo_pois_embs, norm_trans_pois_embs, pair_weights["geo_trans"])
 
         return loss_cl_pois
 
@@ -258,10 +306,6 @@ class DCHL(nn.Module):
         trans_structural_users_embs = torch.sparse.mm(dataset.HG_up, trans_pois_embs)
         trans_batch_users_embs = trans_structural_users_embs[batch["user_idx"]]  # [BS, d]
 
-        # cross view contrastive learning
-        loss_cl_poi = self.cal_loss_cl_pois(hg_pois_embs, geo_pois_embs, trans_pois_embs)
-        loss_cl_user = self.cal_loss_cl_users(hg_batch_users_embs, geo_batch_users_embs, trans_batch_users_embs)
-
         # normalization
         norm_hg_pois_embs = F.normalize(hg_pois_embs, p=2, dim=1)
         norm_geo_pois_embs = F.normalize(geo_pois_embs, p=2, dim=1)
@@ -277,8 +321,32 @@ class DCHL(nn.Module):
         trans_coef = self.trans_gate(norm_trans_batch_users_embs)
 
         # final fusion for user and poi embeddings
+        user_views = torch.stack([norm_hg_batch_users_embs, norm_geo_batch_users_embs, norm_trans_batch_users_embs], dim=1)
+        poi_views = torch.stack([norm_hg_pois_embs, norm_geo_pois_embs, norm_trans_pois_embs], dim=1)
+
         fusion_batch_users_embs = hyper_coef * norm_hg_batch_users_embs + geo_coef * norm_geo_batch_users_embs + trans_coef * norm_trans_batch_users_embs
         fusion_pois_embs = norm_hg_pois_embs + norm_geo_pois_embs + norm_trans_pois_embs
+
+        user_rsea_embs = self.user_rsea_aggregator(user_views)
+        poi_rsea_embs, poi_reliability = self.poi_rsea_aggregator(poi_views, return_reliability=True)
+
+        alpha_user = 0.1 * torch.tanh(self.raw_alpha_user)
+        alpha_poi = 0.1 * torch.tanh(self.raw_alpha_poi)
+
+        fusion_batch_users_embs = fusion_batch_users_embs + alpha_user * (user_rsea_embs - fusion_batch_users_embs)
+        fusion_pois_embs = fusion_pois_embs + alpha_poi * (poi_rsea_embs - fusion_pois_embs)
+
+        # cross view contrastive learning
+        r_hg = poi_reliability[:, 0, 0]
+        r_geo = poi_reliability[:, 1, 0]
+        r_trans = poi_reliability[:, 2, 0]
+        pair_weights = {
+            "hg_geo": (0.5 * (r_hg + r_geo)).detach(),
+            "hg_trans": (0.5 * (r_hg + r_trans)).detach(),
+            "geo_trans": (0.5 * (r_geo + r_trans)).detach(),
+        }
+        loss_cl_poi = self.cal_loss_cl_pois(hg_pois_embs, geo_pois_embs, trans_pois_embs, pair_weights=pair_weights)
+        loss_cl_user = self.cal_loss_cl_users(hg_batch_users_embs, geo_batch_users_embs, trans_batch_users_embs)
 
         # prediction
         prediction = fusion_batch_users_embs @ fusion_pois_embs.T
